@@ -1,0 +1,25 @@
+node_modules/
+dist/
+.env
+.env.*
+!.env.example
+!.env.meta.example
+!.env.webhook.example
+.cloudflare-tunnel-local-managed.local
+coverage/
+*.tsbuildinfo
+*.log
+.DS_Store
+.idea/
+.vscode/
+.data/
+/work/
+# Local planning and implementation contracts; keep machine- and session-specific notes out of Git.
+/PROJECT_CONTEXT.md
+/docs/contrato-mvp-local.md
+/docs/contrato-persistencia-local.md
+*.sqlite
+*.sqlite-wal
+*.sqlite-shm
+*.sqlite.writer.lock
+

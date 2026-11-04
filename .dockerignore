@@ -1,0 +1,8 @@
+**/node_modules
+**/dist
+**/coverage
+**/tsconfig.tsbuildinfo
+.git
+.env
+.env.*
+*.log

@@ -1,0 +1,40 @@
+{
+  "name": "plataforma-atendimento-whatsapp",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "install:all": "npm install --prefix apps/api && npm install --prefix apps/web",
+    "dev:api": "npm run dev --prefix apps/api",
+    "dev:web": "npm run dev --prefix apps/web",
+    "dev:local": "node scripts/dev-local.mjs",
+    "dev:memory": "node scripts/dev-local.mjs --memory",
+    "smoke:local": "node scripts/smoke-local.mjs",
+    "test:local": "node scripts/dev-local.mjs --smoke",
+    "test:sqlite": "node scripts/dev-local.mjs --sqlite --smoke",
+    "test:ollama:smoke": "npm run build --prefix apps/api && node scripts/smoke-local-ai.mjs",
+    "meta:check-local": "node scripts/meta-local.mjs",
+    "meta:verify-channel": "node scripts/meta-verify-channel.mjs --confirm-read-only",
+    "meta:check-webhook": "node scripts/meta-webhook-config.mjs",
+    "meta:bind-test-channel": "node scripts/meta-bind-local-test-channel.mjs",
+    "meta:tunnel": "node scripts/cloudflare-local.mjs",
+    "meta:tunnel:named": "node scripts/cloudflare-local.mjs --named",
+    "meta:tunnel:local-managed": "node scripts/cloudflare-local.mjs --local-managed",
+    "test:meta-config": "node --test scripts/meta-local.test.mjs scripts/meta-verify-channel.test.mjs scripts/meta-webhook-config.test.mjs scripts/cloudflare-local.test.mjs",
+    "dev:postgres": "node scripts/dev-local.mjs --postgres",
+    "test:postgres": "node scripts/dev-local.mjs --postgres --smoke",
+    "db:setup": "node scripts/postgres-local.mjs setup && npm run db:migrate && npm run db:seed",
+    "db:migrate": "node scripts/dev-local.mjs --postgres --migrate-only",
+    "db:seed": "node scripts/postgres-local.mjs seed",
+    "db:start": "node scripts/postgres-local.mjs start",
+    "db:stop": "node scripts/postgres-local.mjs stop",
+    "db:status": "node scripts/postgres-local.mjs status",
+    "build": "npm run build --prefix apps/api && npm run build --prefix apps/web",
+    "typecheck": "npm run typecheck --prefix apps/api && npm run typecheck --prefix apps/web",
+    "test": "npm test --prefix apps/api && npm run test:meta-config",
+    "check": "npm run typecheck && npm test && npm run build"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}
+
