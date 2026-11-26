@@ -7,6 +7,7 @@ import type { InboundMessageType, NormalizedInboundMessage } from "../meta/inbou
 import type {
   Conversation,
   CreateTenantInput,
+  CustomerMessageNotice,
   AttendanceSnapshot,
   AttendanceStateRepository,
   KnowledgeEntry,
@@ -14,6 +15,7 @@ import type {
   Message,
   OutboxEntry,
   OutboundBlockReason,
+  OutboundMessageNotice,
   OutboundStatus,
   PendingInboundEventStore,
   SimulateMessageInput,
@@ -52,6 +54,8 @@ interface ServiceOptions {
   knowledgeAnswerSelector?: KnowledgeAnswerSelector;
   llmAssistant?: LlmAssistant;
   outbound?: LocalOutboundOptions;
+  onCustomerMessage?: (event: CustomerMessageNotice) => void;
+  onOutboundMessage?: (event: OutboundMessageNotice) => void;
 }
 
 const outboundServiceWindowMs = 24 * 60 * 60 * 1_000;
@@ -237,6 +241,8 @@ export class LocalAttendanceService {
   private readonly knowledgeAnswerSelector: KnowledgeAnswerSelector | undefined;
   private readonly llmAssistant: LlmAssistant | undefined;
   private readonly outbound: LocalOutboundOptions | undefined;
+  private readonly onCustomerMessage: ((event: CustomerMessageNotice) => void) | undefined;
+  private readonly onOutboundMessage: ((event: OutboundMessageNotice) => void) | undefined;
   private readonly outbox = new Map<string, OutboxEntry>();
   private readonly changeListeners = new Map<string, Set<() => void>>();
   private workerTimer: ReturnType<typeof setInterval> | undefined;
@@ -254,6 +260,8 @@ export class LocalAttendanceService {
     this.knowledgeAnswerSelector = options.knowledgeAnswerSelector;
     this.llmAssistant = options.llmAssistant;
     this.outbound = options.outbound;
+    this.onCustomerMessage = options.onCustomerMessage;
+    this.onOutboundMessage = options.onOutboundMessage;
     if (this.outbound?.enabled && (
       !this.outbound.sender || !this.outbound.phoneNumberId || !this.outbound.accessToken ||
       !/^[1-9]\d{0,31}$/.test(this.outbound.phoneNumberId) ||
@@ -507,6 +515,7 @@ export class LocalAttendanceService {
       this.createOutboxEntry(conversation, message);
       conversation.lastMessagePreview = text;
       conversation.updatedAt = createdAt;
+      this.notifyOutbound(conversation, message);
       return { message: copyMessage(message), conversation: copyConversation(conversation) };
     });
   }
@@ -881,6 +890,14 @@ export class LocalAttendanceService {
       conversation.lastInboundAt = customerMessage.createdAt;
       conversation.lastMessagePreview = messageText;
       conversation.updatedAt = now;
+      this.notifyCustomer({
+        tenantId,
+        phone: customerPhone,
+        text: messageText,
+        at: customerMessage.createdAt,
+        messageId: customerMessage.id,
+        source: event.source ?? "LEGACY_UNKNOWN"
+      });
 
       if (conversation.state === "BOT_ACTIVE") {
         const shouldHandoff =
@@ -1123,6 +1140,64 @@ export class LocalAttendanceService {
     this.createOutboxEntry(conversation, botMessage);
     conversation.lastMessagePreview = text;
     conversation.updatedAt = now;
+    this.notifyOutbound(conversation, botMessage);
+  }
+
+  markDelivery(tenantId: string, messageId: string, update: {
+    status: "ACCEPTED" | "BLOCKED";
+    resultCode: string | null;
+    providerMessageId?: string;
+  }): void {
+    const entry = this.outbox.get(messageId);
+    const conversationId = entry?.conversationId ?? [...this.messages.entries()]
+      .find(([, items]) => items.some((item) => item.id === messageId))?.[0];
+    if (!conversationId) return;
+    const conversation = this.conversations.get(conversationId);
+    if (!conversation || conversation.tenantId !== tenantId) return;
+    this.mutateTenantState(tenantId, () => {
+      const message = (this.messages.get(conversationId) ?? []).find((item) => item.id === messageId);
+      const current = this.outbox.get(messageId);
+      if (!message || message.conversationId !== conversationId) return;
+      if (current?.status === "SENDING") return;
+      message.deliveryStatus = update.status;
+      if (!current) return;
+      current.status = update.status;
+      current.resultCode = update.resultCode;
+      current.completedAt = this.now().toISOString();
+      current.blockedReason = update.status === "BLOCKED" ? current.blockedReason : null;
+      if (update.status === "ACCEPTED") {
+        current.attemptCount = 1;
+        current.providerMessageId = update.providerMessageId ?? null;
+      }
+    });
+  }
+
+  private notifyCustomer(event: CustomerMessageNotice): void {
+    try {
+      this.onCustomerMessage?.(event);
+    } catch {
+      // O canal não pode desfazer o atendimento já decidido.
+    }
+  }
+
+  private notifyOutbound(conversation: Conversation, message: Message): void {
+    if (message.deliveryStatus === "RECEIVED") return;
+    try {
+      this.onOutboundMessage?.({
+        tenantId: conversation.tenantId,
+        conversationId: conversation.id,
+        messageId: message.id,
+        customerPhone: conversation.customerPhone,
+        text: message.text,
+        role: message.role === "ATTENDANT" ? "ATTENDANT" : "BOT",
+        lastInboundAt: conversation.lastInboundAt,
+        inboundMessageId: conversation.lastInboundMessageId,
+        deliveryStatus: message.deliveryStatus,
+        source: conversation.lastInboundSource
+      });
+    } catch {
+      // Falha de entrega fica no canal; o histórico local permanece.
+    }
   }
 
   private llmFailureOutcome(): LlmTurnOutcome {

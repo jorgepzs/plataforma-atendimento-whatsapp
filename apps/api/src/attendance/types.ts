@@ -150,3 +150,25 @@ export interface SimulateMessageResult {
   status: "PENDING" | "DUPLICATE";
 }
 
+export interface CustomerMessageNotice {
+  tenantId: string;
+  phone: string;
+  text: string;
+  at: string;
+  messageId: string;
+  source: InboundSource | null;
+}
+
+export interface OutboundMessageNotice {
+  tenantId: string;
+  conversationId: string;
+  messageId: string;
+  customerPhone: string;
+  text: string;
+  role: "BOT" | "ATTENDANT";
+  lastInboundAt: string | null;
+  inboundMessageId: string | null;
+  deliveryStatus: OutboundStatus;
+  source: InboundSource | null;
+}
+

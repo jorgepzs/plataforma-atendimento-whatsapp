@@ -1,5 +1,6 @@
 import { z } from "zod";
 import { llmSettingsFromEnvironment, type LlmSettings } from "./llm/settings.js";
+import { loadWhatsAppConfig, type WhatsAppChannelConfig } from "./whatsapp/settings.js";
 
 const booleanFromEnvironment = z.preprocess((value) => {
   if (typeof value !== "string") {
@@ -103,12 +104,25 @@ export interface AppConfig {
   whatsappOutboundAccessToken?: string;
   whatsappOutboundAllowedRecipients: string[];
   llm?: LlmSettings;
+  whatsapp: WhatsAppChannelConfig;
 }
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppConfig {
   const parsed = environmentSchema.parse(environment);
+  const whatsapp = loadWhatsAppConfig(environment);
+  const channelWithoutDemo = whatsapp.enabled && !parsed.ENABLE_LOCAL_DEMO;
 
-  if (parsed.LOCAL_SQLITE_PATH && (
+  if (whatsapp.enabled && !whatsapp.sessionDir) {
+    throw new Error("WHATSAPP_SESSION_DIR é obrigatório quando o canal WhatsApp está ligado.");
+  }
+  if (whatsapp.enabled && !parsed.LOCAL_SQLITE_PATH) {
+    throw new Error("O canal WhatsApp exige LOCAL_SQLITE_PATH para conversas e sessão.");
+  }
+  if (whatsapp.enabled && parsed.DATABASE_URL) {
+    throw new Error("O canal WhatsApp desta versão usa SQLite e não combina com DATABASE_URL.");
+  }
+
+  if (parsed.LOCAL_SQLITE_PATH && !channelWithoutDemo && (
     !parsed.ENABLE_LOCAL_DEMO || parsed.DATABASE_URL || parsed.NODE_ENV === "production" ||
     !["127.0.0.1", "localhost", "::1"].includes(parsed.API_HOST)
   )) {
@@ -158,7 +172,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
   });
 
   if (parsed.NODE_ENV === "production") {
-    if (!parsed.DATABASE_URL) {
+    if (!parsed.DATABASE_URL && !channelWithoutDemo) {
       throw new Error("DATABASE_URL é obrigatória em produção.");
     }
 
@@ -189,7 +203,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     ...(parsed.WHATSAPP_OUTBOUND_ENABLED && parsed.WHATSAPP_OUTBOUND_ACCESS_TOKEN ? { whatsappOutboundAccessToken: parsed.WHATSAPP_OUTBOUND_ACCESS_TOKEN } : {}),
     ...(parsed.DATABASE_URL ? { databaseUrl: parsed.DATABASE_URL } : {}),
     ...(parsed.META_APP_SECRET ? { metaAppSecret: parsed.META_APP_SECRET } : {}),
-    ...(llm ? { llm } : {})
+    ...(llm ? { llm } : {}),
+    whatsapp
   };
 }
 

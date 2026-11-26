@@ -14,6 +14,7 @@ COPY package*.json ./
 RUN npm ci --omit=dev
 COPY --from=build /app/dist ./dist
 COPY --from=build /app/migrations ./migrations
+RUN mkdir -p /data/whatsapp/sessions /data/whatsapp/state && chown -R node:node /data/whatsapp
 USER node
-CMD ["sh", "-c", "node dist/infra/postgres/migrate.js && node dist/server.js"]
+CMD ["sh", "-c", "if [ -n \"$DATABASE_URL\" ]; then node dist/infra/postgres/migrate.js; fi && node dist/server.js"]
 
