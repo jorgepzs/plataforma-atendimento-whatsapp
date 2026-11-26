@@ -26,6 +26,7 @@ export interface CreateChannelOptions {
   resolveChannelId: (tenantId: string) => string | undefined;
   enqueue: (message: NormalizedInboundMessage) => Promise<unknown>;
   onDelivery?: (update: DeliveryUpdate) => void;
+  onMessageAck?: (event: { tenantId: string; providerMessageId: string; ack: "delivered" | "read" | "failed"; detail?: string }) => void;
   log?: (level: "info" | "warn", payload: Record<string, unknown>, message: string) => void;
   clock?: Clock;
   transports?: Partial<Record<WhatsAppProviderId, WhatsAppTransport>>;
@@ -125,12 +126,19 @@ export class WhatsAppChannel {
       this.options.log?.("warn", { tenantId: message.tenantId }, "Mensagem WhatsApp sem canal de atendimento.");
       return;
     }
+    if (message.replyJid) {
+      this.provider.rememberChat(message.tenantId, {
+        contactId: message.from,
+        replyJid: message.replyJid,
+        ...(message.aliases ? { aliases: message.aliases } : {})
+      });
+    }
     const event: NormalizedInboundMessage = {
       provider: "META_WHATSAPP",
       source: "WHATSAPP_QR",
       providerEventId: message.providerMessageId,
       providerPhoneNumberId: channelId,
-      consumerPhoneNumber: message.from,
+      consumerPhoneNumber: message.phone || message.from,
       ...(message.profileName ? { consumerProfileName: message.profileName } : {}),
       occurredAt: message.timestamp,
       type: message.type === "unknown" ? "unknown" : message.type,
@@ -159,31 +167,46 @@ export class WhatsAppChannel {
   }
 
   handleOutbound(event: OutboundMessageNotice): void {
-    if (event.deliveryStatus === "PENDING" || event.deliveryStatus === "SENDING") return;
+    const qr = event.source === "WHATSAPP_QR";
+    if (!qr && (event.deliveryStatus === "PENDING" || event.deliveryStatus === "SENDING")) return;
+    if (qr && (event.deliveryStatus === "ACCEPTED" || event.deliveryStatus === "SENDING")) return;
     const provider = this.store.snapshot().tenants[event.tenantId]?.provider ?? this.options.config.provider;
-    const realIngress = (event.source === "WHATSAPP_QR" && provider === "unofficial_qr")
+    const realIngress = (qr && provider === "unofficial_qr")
       || (event.source === "META_WEBHOOK" && provider === "meta_cloud");
     if (!realIngress) return;
+    const replyJid = this.provider.replyJidFor(event.tenantId, event.customerPhone);
     void this.provider.sendText(event.tenantId, {
       to: event.customerPhone,
       text: event.text,
       kind: "reply",
       role: event.role,
+      ...(replyJid ? { replyJid } : {}),
       ...(event.inboundMessageId ? { inboundMessageId: event.inboundMessageId } : {})
     }).then((outcome) => {
+      if (!outcome.ok) {
+        this.options.log?.("warn", {
+          tenantId: event.tenantId,
+          messageId: event.messageId,
+          reason: outcome.reason,
+          ...(outcome.detail ? { detail: outcome.detail } : {})
+        }, "Falha ao enviar mensagem WhatsApp.");
+      }
+      const resultCode = outcome.ok ? null : [outcome.reason, outcome.detail].filter(Boolean).join(": ");
       this.options.onDelivery?.({
         tenantId: event.tenantId,
         messageId: event.messageId,
         status: outcome.ok ? "ACCEPTED" : "BLOCKED",
-        resultCode: outcome.ok ? null : outcome.reason,
+        resultCode,
         ...(outcome.ok ? { providerMessageId: outcome.providerMessageId } : {})
       });
-    }).catch(() => {
+    }).catch((error: unknown) => {
+      const detail = error instanceof Error ? error.message : "send_failed";
+      this.options.log?.("warn", { tenantId: event.tenantId, messageId: event.messageId, detail }, "Falha ao enviar mensagem WhatsApp.");
       this.options.onDelivery?.({
         tenantId: event.tenantId,
         messageId: event.messageId,
         status: "BLOCKED",
-        resultCode: "network"
+        resultCode: `network: ${detail}`
       });
     });
   }
@@ -200,7 +223,8 @@ export function createWhatsAppChannel(options: CreateChannelOptions): WhatsAppCh
     reconnectBaseMs: options.config.antiBan.reconnectBaseMs,
     reconnectMaxMs: options.config.antiBan.reconnectMaxMs,
     onInbound: (message) => { void channel?.acceptInbound(message); },
-    onStatus: (status) => channel?.provider.observeStatus(status)
+    onStatus: (status) => channel?.provider.observeStatus(status),
+    onMessageAck: (event) => options.onMessageAck?.(event)
   });
   const meta = options.transports?.meta_cloud ?? new MetaCloudTransport({
     store,

@@ -179,6 +179,8 @@ GET  /api/v1/tenants/{tenantId}/whatsapp/qr
 
 Só uma instância pode abrir a mesma sessão. Um segundo processo encontra o lock e não conecta.
 
+Uma conversa que chega com JID `@lid` é respondida nesse mesmo JID. O número de telefone, quando o Baileys envia `senderPn`, fica só para exibição e para unir o mesmo contato. O painel mostra a resposta como "na fila" até o `sendMessage` concluir; se falhar, a mensagem fica com o erro e pode ser reenviada.
+
 ### Padrões anti-ban, e por quê
 
 O protocolo não oficial imita o WhatsApp Web. Rajadas, mensagens iguais e número novo em volume alto são o caminho mais curto para restrição ou banimento. Os padrões abaixo são de propósito baixos. Dá para apertar por empresa; o código recusa valores acima do teto.

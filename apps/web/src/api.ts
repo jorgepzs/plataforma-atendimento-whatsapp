@@ -150,6 +150,7 @@ export interface Message {
   text: string;
   createdAt: string;
   deliveryStatus: "RECEIVED" | "SIMULATED" | "PENDING" | "SENDING" | "ACCEPTED" | "BLOCKED" | "HTTP_ERROR" | "INDETERMINATE";
+  deliveryDetail?: string | null;
   authorName: string | null;
 }
 

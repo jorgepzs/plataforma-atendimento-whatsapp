@@ -17,6 +17,8 @@ npm run install:all
 npm run dev:local
 ```
 
+`install:all` roda `npm ci` dentro de `apps/api` e `apps/web`. Não use `npm install --prefix` a partir da raiz: no Windows isso pode gravar `"plataforma-atendimento-whatsapp": "file:../.."` no `package.json` do app. `dev:local` lê `WHATSAPP_*`, `LLM_*` e `LOCAL_AI_*` do `.env` da raiz.
+
 O painel fica em `http://127.0.0.1:5173` e a API em `http://127.0.0.1:3000`. O launcher inicia ambos em loopback, habilita a demonstração e usa `.data/attendance.sqlite`. Os dados sobrevivem a reinícios; o arquivo e a pasta `.data/` são ignorados pelo Git.
 
 Para rodar sem persistência:

@@ -4,7 +4,7 @@ import type { Clock } from "./clock.js";
 import { reconnectDelay } from "./clock.js";
 import { classifyDisconnect, disconnectDetails } from "./disconnect.js";
 import { acquireDirectoryLock, type SessionLock } from "./session-lock.js";
-import { phoneFromJid, phoneToJid, safeTenantId } from "./text.js";
+import { chatAddressFromInbound, destinationJid, phoneFromJid, safeTenantId } from "./text.js";
 import type { WhatsAppConnectionStatus, WhatsAppInboundMessage, WhatsAppStatus, WhatsAppTransport, TransportSendResult } from "./types.js";
 
 export interface BaileysLikeSocket {
@@ -45,8 +45,18 @@ export interface BaileysTransportOptions {
   reconnectMaxMs: number;
   onInbound: (message: WhatsAppInboundMessage) => void;
   onStatus: (status: WhatsAppStatus) => void;
+  onMessageAck?: (event: { tenantId: string; providerMessageId: string; ack: "delivered" | "read" | "failed"; detail?: string }) => void;
   toDataUrl?: (qr: string) => Promise<string>;
   isAlive?: (pid: number) => boolean;
+}
+
+function errorDetail(error: unknown): string {
+  const message = error instanceof Error ? error.message : "send_failed";
+  return message.replace(/\s+/g, " ").slice(0, 300) || "send_failed";
+}
+
+function firstString(...values: unknown[]): string | undefined {
+  return values.find((value): value is string => typeof value === "string" && value.trim().length > 0);
 }
 
 function messageText(content: Record<string, any> | undefined): string | undefined {
@@ -143,11 +153,15 @@ export class BaileysWhatsAppTransport implements WhatsAppTransport {
   async sendText(tenantId: string, input: { to: string; text: string }): Promise<TransportSendResult> {
     const socket = this.readySocket(tenantId);
     if (!socket) return { ok: false, reason: "not_connected" };
+    const jid = destinationJid(input.to);
+    if (!jid) return { ok: false, reason: "rejected", detail: "invalid_jid" };
     try {
-      const result = await socket.sendMessage(phoneToJid(input.to), { text: input.text });
-      return { ok: true, providerMessageId: result?.key?.id || "sent" };
-    } catch {
-      return { ok: false, reason: "network" };
+      const result = await socket.sendMessage(jid, { text: input.text });
+      const providerMessageId = result?.key?.id;
+      if (!providerMessageId) return { ok: false, reason: "rejected", detail: "missing_message_id" };
+      return { ok: true, providerMessageId };
+    } catch (error) {
+      return { ok: false, reason: "network", detail: errorDetail(error) };
     }
   }
 
@@ -169,24 +183,32 @@ export class BaileysWhatsAppTransport implements WhatsAppTransport {
         : input.kind === "video"
           ? { video: buffer, mimetype: input.mimeType, ...(input.caption ? { caption: input.caption } : {}) }
           : { document: buffer, mimetype: input.mimeType, ...(input.fileName ? { fileName: input.fileName } : {}), ...(input.caption ? { caption: input.caption } : {}) };
+    const jid = destinationJid(input.to);
+    if (!jid) return { ok: false, reason: "rejected", detail: "invalid_jid" };
     try {
-      const result = await socket.sendMessage(phoneToJid(input.to), content);
-      return { ok: true, providerMessageId: result?.key?.id || "sent" };
-    } catch {
-      return { ok: false, reason: "network" };
+      const result = await socket.sendMessage(jid, content);
+      const providerMessageId = result?.key?.id;
+      if (!providerMessageId) return { ok: false, reason: "rejected", detail: "missing_message_id" };
+      return { ok: true, providerMessageId };
+    } catch (error) {
+      return { ok: false, reason: "network", detail: errorDetail(error) };
     }
   }
 
   async sendPresence(tenantId: string, to: string, presence: "composing" | "paused"): Promise<void> {
     const socket = this.readySocket(tenantId);
     if (!socket) return;
-    await socket.sendPresenceUpdate(presence, phoneToJid(to));
+    const jid = destinationJid(to);
+    if (!jid) return;
+    await socket.sendPresenceUpdate(presence, jid);
   }
 
   async markRead(tenantId: string, input: { to: string; messageId: string }): Promise<void> {
     const socket = this.readySocket(tenantId);
     if (!socket) return;
-    await socket.readMessages([{ remoteJid: phoneToJid(input.to), id: input.messageId, fromMe: false }]);
+    const jid = destinationJid(input.to);
+    if (!jid) return;
+    await socket.readMessages([{ remoteJid: jid, id: input.messageId, fromMe: false }]);
   }
 
   async restorePairedSessions(): Promise<void> {
@@ -258,6 +280,9 @@ export class BaileysWhatsAppTransport implements WhatsAppTransport {
     socket.ev.on("messages.upsert", (update) => {
       this.onMessages(tenantId, update);
     });
+    socket.ev.on("messages.update", (updates) => {
+      this.onMessageUpdates(tenantId, updates);
+    });
   }
 
   private async onConnection(tenantId: string, generation: number, socket: BaileysLikeSocket, update: any): Promise<void> {
@@ -320,9 +345,10 @@ export class BaileysWhatsAppTransport implements WhatsAppTransport {
     for (const message of update.messages) {
       const remote = message?.key?.remoteJid;
       if (typeof remote !== "string" || message?.key?.fromMe) continue;
-      const from = phoneFromJid(remote);
+      const alt = firstString(message?.key?.senderPn, message?.key?.remoteJidAlt, message?.key?.participantPn);
+      const address = chatAddressFromInbound(remote, alt);
       const id = message?.key?.id;
-      if (!from || typeof id !== "string" || !id) continue;
+      if (!address || typeof id !== "string" || !id) continue;
       const content = message?.message as Record<string, any> | undefined;
       const text = messageText(content);
       const timestampValue = Number(message?.messageTimestamp);
@@ -334,12 +360,31 @@ export class BaileysWhatsAppTransport implements WhatsAppTransport {
         tenantId,
         provider: "unofficial_qr",
         providerMessageId: id,
-        from,
+        from: address.contactId,
+        replyJid: address.replyJid,
+        phone: address.phone,
+        ...(address.aliases.length > 0 ? { aliases: address.aliases } : {}),
         ...(profileName ? { profileName } : {}),
         timestamp,
         type: messageType(content),
         ...(text ? { text } : {})
       });
+    }
+  }
+
+  private onMessageUpdates(tenantId: string, updates: unknown): void {
+    if (!Array.isArray(updates)) return;
+    for (const item of updates) {
+      const key = item?.key;
+      const id = key?.id;
+      if (key?.fromMe !== true || typeof id !== "string" || !id) continue;
+      const status = Number(item?.update?.status);
+      const detail = Array.isArray(item?.update?.messageStubParameters)
+        ? item.update.messageStubParameters.filter((part: unknown) => typeof part === "string").join(" ")
+        : undefined;
+      const ack = status === 3 ? "delivered" : status === 4 || status === 5 ? "read" : status === 0 ? "failed" : undefined;
+      if (!ack) continue;
+      this.options.onMessageAck?.({ tenantId, providerMessageId: id, ack, ...(detail ? { detail } : {}) });
     }
   }
 

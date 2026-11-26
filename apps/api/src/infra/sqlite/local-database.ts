@@ -311,6 +311,13 @@ const migrations = [
       );
       CREATE INDEX attendance_orders_tenant_idx ON attendance_orders (tenant_id, ordinal);
     `
+  },
+  {
+    version: 7,
+    name: "message_delivery_detail",
+    sql: `
+      ALTER TABLE attendance_messages ADD COLUMN delivery_detail TEXT;
+    `
   }
 ] as const;
 
@@ -443,7 +450,7 @@ class SqliteAttendanceRepository implements AttendanceStateRepository {
       FROM attendance_conversations ORDER BY ordinal
     `).all() as Array<Record<string, string | number | null>>;
     const messages = this.database.connection.prepare(`
-      SELECT id, conversation_id, role, text, created_at, delivery_status, author_name
+      SELECT id, conversation_id, role, text, created_at, delivery_status, delivery_detail, author_name
       FROM attendance_messages ORDER BY ordinal
     `).all() as Array<Record<string, string | number | null>>;
     const processedInboundIds = this.database.connection.prepare(`
@@ -487,6 +494,7 @@ class SqliteAttendanceRepository implements AttendanceStateRepository {
         role: String(row.role) as AttendanceSnapshot["messages"][number]["role"],
         text: String(row.text), createdAt: String(row.created_at),
         deliveryStatus: String(row.delivery_status) as AttendanceSnapshot["messages"][number]["deliveryStatus"],
+        ...(row.delivery_detail ? { deliveryDetail: String(row.delivery_detail) } : {}),
         authorName: row.author_name === null ? null : String(row.author_name)
       })),
       outbox: outbox.map((row) => ({
@@ -548,12 +556,12 @@ class SqliteAttendanceRepository implements AttendanceStateRepository {
 
       const insertMessage = this.database.connection.prepare(`
         INSERT INTO attendance_messages
-          (id, ordinal, conversation_id, role, text, created_at, delivery_status, author_name)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          (id, ordinal, conversation_id, role, text, created_at, delivery_status, delivery_detail, author_name)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       snapshot.messages.forEach((message, ordinal) => insertMessage.run(
         message.id, ordinal, message.conversationId, message.role, message.text, message.createdAt,
-        message.deliveryStatus, message.authorName
+        message.deliveryStatus, message.deliveryDetail ?? null, message.authorName
       ));
 
       const insertOutbox = this.database.connection.prepare(`

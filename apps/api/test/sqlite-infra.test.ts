@@ -48,7 +48,7 @@ describe("SQLite local infrastructure", () => {
     });
     database.attendanceRepository.save(snapshot);
     expect(database.attendanceRepository.load()).toEqual(snapshot);
-    expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 6 });
+    expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 7 });
 
     const qrSnapshot: AttendanceSnapshot = {
       ...snapshot,
@@ -118,7 +118,7 @@ describe("SQLite local infrastructure", () => {
 
     database = new SqliteLocalDatabase(filename);
     expect(database.attendanceRepository.load()).toEqual(snapshot);
-    expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 6 });
+    expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 7 });
   });
 
   it("persists identity hashes and sessions without plaintext credentials", () => {

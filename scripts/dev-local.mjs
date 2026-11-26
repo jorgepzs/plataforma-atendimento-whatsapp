@@ -5,6 +5,7 @@ import { createServer } from "node:net";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseEnv } from "node:util";
+import { selectDocumentedEnvironment } from "./local-env.mjs";
 import { localSmokeCredentials, runSmoke } from "./smoke-local.mjs";
 
 const projectRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -25,12 +26,11 @@ const children = [];
 let stopping = false;
 let shutdownPromise;
 
-function llmEnvironmentFromFile() {
+function documentedEnvironmentFromFile() {
   const envPath = resolve(projectRoot, ".env");
   if (!existsSync(envPath)) return {};
   try {
-    const parsed = parseEnv(readFileSync(envPath, "utf8"));
-    return Object.fromEntries(Object.entries(parsed).filter(([key]) => key.startsWith("LLM_")));
+    return selectDocumentedEnvironment(parseEnv(readFileSync(envPath, "utf8")));
   } catch {
     return {};
   }
@@ -199,7 +199,7 @@ async function main() {
       : resolve(process.env.LOCAL_SQLITE_PATH || resolve(projectRoot, ".data/attendance.sqlite"))
     : "";
   const apiEnv = {
-    ...llmEnvironmentFromFile(),
+    ...documentedEnvironmentFromFile(),
     ...process.env,
     ...postgresEnvironment,
     NODE_ENV: "development",

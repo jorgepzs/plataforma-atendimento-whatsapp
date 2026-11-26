@@ -742,7 +742,7 @@ export class LocalAttendanceService {
           return;
         }
       }
-      const pending = [...this.outbox.values()].find((entry) => entry.status === "PENDING");
+      const pending = [...this.outbox.values()].find((entry) => entry.status === "PENDING" && entry.source !== "WHATSAPP_QR");
       if (!pending) return;
       const conversation = this.conversations.get(pending.conversationId);
       const message = (this.messages.get(pending.conversationId) ?? []).find((item) => item.id === pending.messageId);
@@ -825,11 +825,15 @@ export class LocalAttendanceService {
 
   private createOutboxEntry(conversation: Conversation, message: Message): void {
     const tenant = this.getTenantRecord(conversation.tenantId).tenant;
-    const blockedReason = this.outboundBlockReason(conversation, tenant.channelPhoneNumberId);
-    const status: OutboundStatus = !this.outbound?.enabled
-      ? "SIMULATED"
-      : blockedReason ? "BLOCKED" : "PENDING";
+    const qrReply = conversation.lastInboundSource === "WHATSAPP_QR";
+    const blockedReason = qrReply ? null : this.outboundBlockReason(conversation, tenant.channelPhoneNumberId);
+    const status: OutboundStatus = qrReply
+      ? "PENDING"
+      : !this.outbound?.enabled
+        ? "SIMULATED"
+        : blockedReason ? "BLOCKED" : "PENDING";
     message.deliveryStatus = status;
+    if (!qrReply) message.deliveryDetail = null;
     const entry: OutboxEntry = {
       id: message.id,
       tenantId: conversation.tenantId,
@@ -843,7 +847,7 @@ export class LocalAttendanceService {
       blockedReason: this.outbound?.enabled ? blockedReason : null,
       attemptCount: 0,
       providerMessageId: null,
-      resultCode: !this.outbound?.enabled ? "outbound_disabled" : blockedReason,
+      resultCode: qrReply ? null : !this.outbound?.enabled ? "outbound_disabled" : blockedReason,
       createdAt: message.createdAt,
       attemptedAt: null,
       completedAt: status === "BLOCKED" ? message.createdAt : null
@@ -1343,6 +1347,9 @@ export class LocalAttendanceService {
       if (!message || message.conversationId !== conversationId) return;
       if (current?.status === "SENDING") return;
       message.deliveryStatus = update.status;
+      message.deliveryDetail = update.status === "BLOCKED"
+        ? update.resultCode
+        : update.resultCode === "delivered" || update.resultCode === "read" ? update.resultCode : null;
       if (!current) return;
       current.status = update.status;
       current.resultCode = update.resultCode;
@@ -1352,6 +1359,56 @@ export class LocalAttendanceService {
         current.attemptCount = 1;
         current.providerMessageId = update.providerMessageId ?? null;
       }
+    });
+  }
+
+  noteProviderAck(tenantId: string, providerMessageId: string, ack: "delivered" | "read" | "failed", detail?: string): void {
+    const entry = [...this.outbox.values()].find((item) => item.tenantId === tenantId && item.providerMessageId === providerMessageId);
+    if (!entry) return;
+    const rank = (value: string | null | undefined) => value === "read" ? 2 : value === "delivered" ? 1 : 0;
+    this.mutateTenantState(tenantId, () => {
+      const current = this.outbox.get(entry.id);
+      const message = (this.messages.get(entry.conversationId) ?? []).find((item) => item.id === entry.messageId);
+      if (!current || !message || message.conversationId !== entry.conversationId) return;
+      if (ack === "failed") {
+        if (rank(message.deliveryDetail) > 0) return;
+        current.status = "BLOCKED";
+        current.resultCode = detail || "ack_error";
+        current.blockedReason = null;
+        message.deliveryStatus = "BLOCKED";
+        message.deliveryDetail = current.resultCode;
+        return;
+      }
+      if (rank(ack) <= rank(message.deliveryDetail)) return;
+      current.status = "ACCEPTED";
+      current.resultCode = ack;
+      message.deliveryStatus = "ACCEPTED";
+      message.deliveryDetail = ack;
+    });
+  }
+
+  retryOutbound(tenantId: string, conversationId: string, messageId: string): Message {
+    const conversation = this.getConversationRecord(tenantId, conversationId);
+    const message = (this.messages.get(conversationId) ?? []).find((item) => item.id === messageId);
+    if (!message) throw new AttendanceError(404, "message_not_found", "Mensagem não encontrada.");
+    if (!["BLOCKED", "HTTP_ERROR", "INDETERMINATE"].includes(message.deliveryStatus)) {
+      throw new AttendanceError(409, "message_not_retryable", "Só uma mensagem que falhou pode ser reenviada.");
+    }
+    return this.mutateTenantState(tenantId, () => {
+      const current = (this.messages.get(conversationId) ?? []).find((item) => item.id === messageId);
+      if (!current) throw new AttendanceError(404, "message_not_found", "Mensagem não encontrada.");
+      current.deliveryStatus = "PENDING";
+      current.deliveryDetail = null;
+      const entry = this.outbox.get(messageId);
+      if (entry) {
+        entry.status = "PENDING";
+        entry.resultCode = null;
+        entry.blockedReason = null;
+        entry.completedAt = null;
+        entry.providerMessageId = null;
+      }
+      this.notifyOutbound(conversation, current);
+      return copyMessage(current);
     });
   }
 

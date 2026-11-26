@@ -300,6 +300,20 @@ export async function registerAttendanceRoutes(
     return reply.send({ conversation: service.claim(tenantId, conversationId, session.user.id) });
   });
 
+  app.post<{ Params: unknown; Body: unknown }>("/api/v1/tenants/:tenantId/conversations/:conversationId/messages/:messageId/retry", async (request, reply) => {
+    const params = body(z.strictObject({
+      tenantId: tenantIdSchema,
+      conversationId: z.string().min(1).max(128),
+      messageId: z.string().min(1).max(128)
+    }), request.params);
+    const session = await requireWrite(request, sessions);
+    await sessions.requireTenant(session, params.tenantId);
+    noBody(request.body);
+    return reply.send({
+      message: service.retryOutbound(params.tenantId, params.conversationId, params.messageId)
+    });
+  });
+
   app.post<{ Params: unknown; Body: unknown }>("/api/v1/tenants/:tenantId/conversations/:conversationId/reply", async (request, reply) => {
     const { tenantId, conversationId } = body(conversationParamsSchema, request.params);
     const session = await requireWrite(request, sessions);

@@ -19,7 +19,12 @@ export interface WhatsAppInboundMessage {
   tenantId: string;
   provider: WhatsAppProviderId;
   providerMessageId: string;
+  /** Identidade estável do contato: telefone ou `lid:<id>`. */
   from: string;
+  /** JID do chat de origem. Respostas, presença e leitura usam este valor. */
+  replyJid: string;
+  phone?: string | null;
+  aliases?: string[];
   profileName?: string;
   timestamp: Date;
   type: WhatsAppInboundType;
@@ -50,6 +55,8 @@ export interface WhatsAppOutboundText {
   kind: "reply" | "proactive";
   role: "BOT" | "ATTENDANT" | "SYSTEM";
   inboundMessageId?: string;
+  /** JID real do chat. Quando ausente, o canal usa o JID guardado para `to`. */
+  replyJid?: string;
   /** Confirmação única depois de SAIR/PARAR/STOP. */
   optOutNotice?: boolean;
 }
@@ -67,7 +74,7 @@ export interface WhatsAppOutboundMedia {
 
 export type WhatsAppSendOutcome =
   | { ok: true; providerMessageId: string; chunks: number }
-  | { ok: false; reason: string };
+  | { ok: false; reason: string; detail?: string };
 
 /**
  * Contrato usado pelo atendimento, pela fila e pelo painel.

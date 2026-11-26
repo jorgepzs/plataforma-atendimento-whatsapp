@@ -1,8 +1,11 @@
 import { useEffect, useState, type FormEvent, type ReactNode } from "react";
 import {
+  AlertCircle,
   BookOpen,
   Bot,
   Check,
+  CheckCheck,
+  Clock,
   Headset,
   LayoutDashboard,
   LogOut,
@@ -350,6 +353,23 @@ function Inbox({
     }
   }
 
+  async function retry(messageId: string) {
+    if (!detail) return;
+    setBusy(true);
+    setError("");
+    try {
+      await apiRequest(tenantPath(tenantId, `conversations/${encodeURIComponent(detail.conversation.id)}/messages/${encodeURIComponent(messageId)}/retry`), {
+        method: "POST",
+        csrfToken: session.csrfToken
+      });
+    } catch (reason) {
+      if (reason instanceof ApiError && reason.status === 401) onSessionExpired();
+      else setError(formatApiError(reason));
+    } finally {
+      setBusy(false);
+    }
+  }
+
   async function simulate(event: FormEvent) {
     event.preventDefault();
     setBusy(true);
@@ -397,11 +417,18 @@ function Inbox({
           <>
             <header>
               <h2>{conversation.customerName}</h2>
-              <span className="ops-muted">{conversation.customerPhone}</span>
+              <span className="ops-muted">{personLabel(conversation.customerPhone)}</span>
             </header>
             {error && <div className="ops-alert bad">{error}</div>}
             <div className="ops-messages">
-              {detail.messages.map((message) => <Bubble key={message.id} message={message} />)}
+              {detail.messages.map((message) => (
+                <Bubble
+                  key={message.id}
+                  message={message}
+                  busy={busy}
+                  onRetry={message.role === "CUSTOMER" ? undefined : () => void retry(message.id)}
+                />
+              ))}
             </div>
             <div className="ops-actions">
               {conversation.state === "BOT_ACTIVE" && <button className="secondary-button compact" type="button" disabled={busy} onClick={() => void act("handoff")}>Passar para pessoa</button>}
@@ -422,11 +449,37 @@ function Inbox({
   );
 }
 
-function Bubble({ message }: { message: Message }) {
+function personLabel(phone: string): string {
+  if (phone.startsWith("lid:")) return `LID •••${phone.slice(-4)}`;
+  return phone;
+}
+
+function deliveryMark(message: Message): { label: string; failed: boolean } {
+  const detail = message.deliveryDetail ?? "";
+  if (message.deliveryStatus === "PENDING" || message.deliveryStatus === "SENDING") return { label: "Na fila", failed: false };
+  if (message.deliveryStatus === "ACCEPTED" && detail === "read") return { label: "Lida", failed: false };
+  if (message.deliveryStatus === "ACCEPTED" && detail === "delivered") return { label: "Entregue", failed: false };
+  if (message.deliveryStatus === "ACCEPTED") return { label: "Enviada", failed: false };
+  if (message.deliveryStatus === "BLOCKED" || message.deliveryStatus === "HTTP_ERROR" || message.deliveryStatus === "INDETERMINATE") {
+    return { label: detail || "Falhou", failed: true };
+  }
+  if (message.deliveryStatus === "SIMULATED") return { label: "Só no painel", failed: false };
+  return { label: message.deliveryStatus, failed: false };
+}
+
+function Bubble({ message, busy, onRetry }: { message: Message; busy: boolean; onRetry?: () => void }) {
+  const mark = message.role === "CUSTOMER" ? null : deliveryMark(message);
   return (
     <article className={`ops-bubble ${message.role.toLowerCase()}`}>
       <small>{message.role === "CUSTOMER" ? "Cliente" : message.role === "BOT" ? "Assistente" : message.authorName ?? "Atendente"}</small>
       {message.text}
+      {mark && (
+        <small>
+          {mark.failed ? <AlertCircle size={11} /> : mark.label === "Na fila" ? <Clock size={11} /> : mark.label === "Enviada" ? <Check size={11} /> : <CheckCheck size={11} />}
+          {" "}{mark.label}
+          {mark.failed && onRetry && <button type="button" onClick={onRetry} disabled={busy}>Reenviar</button>}
+        </small>
+      )}
     </article>
   );
 }

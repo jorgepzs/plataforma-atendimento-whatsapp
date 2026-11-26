@@ -122,6 +122,8 @@ export interface Message {
   text: string;
   createdAt: string;
   deliveryStatus: "RECEIVED" | OutboundStatus;
+  /** Erro de envio, ou `delivered` / `read` depois do aceite do WhatsApp. */
+  deliveryDetail?: string | null;
   authorName: string | null;
 }
 
