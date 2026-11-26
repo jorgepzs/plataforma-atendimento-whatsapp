@@ -6,7 +6,8 @@ export async function registerSystemRoutes(
   store: InboundEventStore,
   localDemoEnabled = false,
   localAiEnabled = false,
-  whatsappOutboundEnabled = false
+  whatsappOutboundEnabled = false,
+  llm: { provider: "openrouter" | "local"; model: string } | null = null
 ): Promise<void> {
   app.get("/api/v1/system/info", async () => ({
     product: "Plataforma de atendimento por WhatsApp",
@@ -18,6 +19,7 @@ export async function registerSystemRoutes(
     whatsappOutboundEnabled,
     attendancePersistence: localDemoEnabled ? store.kind === "sqlite" ? "sqlite" : "memory" : null,
     outboundMode: whatsappOutboundEnabled ? "cloud-api-local-test" : "simulated",
+    llm: llm ? { enabled: true, provider: llm.provider, model: llm.model } : { enabled: false },
     capabilities: [
       "meta.webhook.verify",
       "meta.webhook.receive",
@@ -26,6 +28,7 @@ export async function registerSystemRoutes(
       "message.cost.guard",
       ...(localDemoEnabled ? ["auth.local.session", "attendance.local.worker", "attendance.human.queue", "tenant.local.configuration"] : []),
       ...(localAiEnabled ? ["assistant.local.knowledge-classification"] : []),
+      ...(llm ? ["assistant.llm.gateway"] : []),
       ...(whatsappOutboundEnabled ? ["whatsapp.text.send.local-test"] : []),
       ...(localDemoEnabled && store.kind === "sqlite" ? ["attendance.local.persistence", "attendance.queue.recovery"] : [])
     ]

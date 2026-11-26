@@ -37,6 +37,13 @@ const updateConfigSchema = z.strictObject({
   ).max(100),
   handoffKeywords: z.array(z.string().trim().min(1).max(80)).max(50),
   assistantMode: z.enum(["approved_faq", "local_ai"]).optional(),
+  llm: z.strictObject({
+    provider: z.enum(["openrouter", "local"]).optional(),
+    baseUrl: z.string().trim().min(1).max(300).optional(),
+    model: z.string().trim().regex(/^[A-Za-z0-9][A-Za-z0-9._:/-]{0,127}$/).optional(),
+    supportsTools: z.boolean().optional(),
+    apiKey: z.string().min(1).max(512).regex(/^\S+$/).nullable().optional()
+  }).nullable().optional(),
   version: z.number().int().min(1).max(Number.MAX_SAFE_INTEGER)
 });
 const simulateSchema = z.strictObject({

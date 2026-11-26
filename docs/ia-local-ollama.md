@@ -1,5 +1,7 @@
 # Classificação local de FAQ com Ollama
 
+> O classificador desta página continua restrito à FAQ aprovada e ao endpoint nativo do Ollama (`/api/chat`). Para OpenRouter, ou para a API compatível com OpenAI de Ollama e LM Studio (`/v1`), use o gateway descrito no [ADR 0004](adr/0004-gateway-llm-compativel-com-openai.md) e no README. Os dois caminhos podem coexistir: este classificador só entra quando a empresa escolhe `IA local (Ollama)`.
+
 ## Escopo
 
 O seletor local ajuda a identificar qual resposta previamente aprovada pode responder à mensagem. O modelo não redige a resposta ao consumidor, não executa ferramentas e não confirma pedidos, reservas ou agendamentos. Sem uma escolha segura, o fluxo encaminha a conversa para uma pessoa.

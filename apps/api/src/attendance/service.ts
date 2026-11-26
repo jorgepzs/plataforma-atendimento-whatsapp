@@ -24,6 +24,8 @@ import type {
   UpdateTenantConfigInput
 } from "./types.js";
 import type { KnowledgeAnswerSelector } from "./knowledge-classifier.js";
+import type { LlmAssistant, LlmTurnOutcome } from "../llm/assistant.js";
+import { LlmSettingsError, mergeTenantLlmUpdate, presentTenantLlmOverride, copyTenantLlmOverride } from "../llm/settings.js";
 
 export class AttendanceError extends Error {
   readonly statusCode: number;
@@ -48,6 +50,7 @@ interface ServiceOptions {
   workerIntervalMs?: number;
   repository?: AttendanceStateRepository;
   knowledgeAnswerSelector?: KnowledgeAnswerSelector;
+  llmAssistant?: LlmAssistant;
   outbound?: LocalOutboundOptions;
 }
 
@@ -127,12 +130,28 @@ function copyTenant(tenant: Tenant): Tenant {
 }
 
 function copyConfig(config: TenantConfig): TenantConfig {
+  const llm = copyTenantLlmOverride(config.llm);
   return {
-    ...config,
-    assistantMode: config.assistantMode ?? "approved_faq",
+    businessName: config.businessName,
+    segment: config.segment,
+    greeting: config.greeting,
     knowledge: config.knowledge.map((entry) => ({ ...entry })),
-    handoffKeywords: [...config.handoffKeywords]
+    handoffKeywords: [...config.handoffKeywords],
+    assistantMode: config.assistantMode ?? "approved_faq",
+    version: config.version,
+    ...(llm ? { llm } : {})
   };
+}
+
+function presentConfig(config: TenantConfig): TenantConfig {
+  const copy = copyConfig(config);
+  if (!copy.llm) return copy;
+  const llm = presentTenantLlmOverride(copy.llm);
+  if (!llm) {
+    const { llm: _llm, ...rest } = copy;
+    return rest;
+  }
+  return { ...copy, llm };
 }
 
 function copyConversation(conversation: Conversation): Conversation {
@@ -216,6 +235,7 @@ export class LocalAttendanceService {
   private readonly workerIntervalMs: number;
   private readonly repository: AttendanceStateRepository | undefined;
   private readonly knowledgeAnswerSelector: KnowledgeAnswerSelector | undefined;
+  private readonly llmAssistant: LlmAssistant | undefined;
   private readonly outbound: LocalOutboundOptions | undefined;
   private readonly outbox = new Map<string, OutboxEntry>();
   private readonly changeListeners = new Map<string, Set<() => void>>();
@@ -232,6 +252,7 @@ export class LocalAttendanceService {
     this.workerIntervalMs = options.workerIntervalMs ?? 250;
     this.repository = options.repository;
     this.knowledgeAnswerSelector = options.knowledgeAnswerSelector;
+    this.llmAssistant = options.llmAssistant;
     this.outbound = options.outbound;
     if (this.outbound?.enabled && (
       !this.outbound.sender || !this.outbound.phoneNumberId || !this.outbound.accessToken ||
@@ -338,7 +359,7 @@ export class LocalAttendanceService {
 
   getConfig(tenantId: string): { tenant: Tenant; config: TenantConfig } {
     const record = this.getTenantRecord(tenantId);
-    return { tenant: copyTenant(record.tenant), config: copyConfig(record.config) };
+    return { tenant: copyTenant(record.tenant), config: presentConfig(record.config) };
   }
 
   reloadFromRepository(): void {
@@ -361,6 +382,15 @@ export class LocalAttendanceService {
     return this.mutateTenantState(tenantId, () => {
       record.tenant.displayName = input.businessName;
       record.tenant.segment = input.segment;
+      let llm: TenantConfig["llm"];
+      try {
+        llm = mergeTenantLlmUpdate(record.config.llm, input.llm);
+      } catch (error) {
+        if (error instanceof LlmSettingsError) {
+          throw new AttendanceError(400, "invalid_llm_override", error.message);
+        }
+        throw error;
+      }
       record.config = {
         businessName: input.businessName,
         segment: input.segment,
@@ -368,9 +398,10 @@ export class LocalAttendanceService {
         knowledge: input.knowledge.map((entry) => ({ ...entry })),
         handoffKeywords: [...input.handoffKeywords],
         assistantMode: input.assistantMode ?? record.config.assistantMode ?? "approved_faq",
-        version: record.config.version + 1
+        version: record.config.version + 1,
+        ...(llm ? { llm } : {})
       };
-      return { tenant: copyTenant(record.tenant), config: copyConfig(record.config) };
+      return { tenant: copyTenant(record.tenant), config: presentConfig(record.config) };
     });
   }
 
@@ -762,10 +793,10 @@ export class LocalAttendanceService {
     const exactAnswer = textMessage ? approvedAnswer(text, record.config.knowledge) : undefined;
     const greeting = textMessage && isGreeting(text) ? record.config.greeting : undefined;
     let selectedKnowledge: KnowledgeEntry | undefined;
-    if (
+    const selectorEligible =
       canUseBot && !initiallyHandled && !exactAnswer && !greeting &&
-      record.config.assistantMode === "local_ai" && this.knowledgeAnswerSelector && record.config.knowledge.length > 0
-    ) {
+      record.config.assistantMode === "local_ai" && this.knowledgeAnswerSelector && record.config.knowledge.length > 0;
+    if (selectorEligible && this.knowledgeAnswerSelector) {
       const knowledgeSnapshot = record.config.knowledge.map((entry) => ({ ...entry }));
       try {
         const selectedIndex = await this.knowledgeAnswerSelector.selectAnswerIndex({
@@ -779,6 +810,22 @@ export class LocalAttendanceService {
         }
       } catch {
         // Falha fechada: sem classificação local, a mensagem será encaminhada a uma pessoa.
+      }
+    }
+    let llmOutcome: LlmTurnOutcome | undefined;
+    if (canUseBot && !initiallyHandled && !exactAnswer && !greeting && !selectorEligible && this.llmAssistant) {
+      const knowledgeSnapshot = record.config.knowledge.map((entry) => ({ ...entry }));
+      const override = copyTenantLlmOverride(record.config.llm);
+      try {
+        llmOutcome = await this.llmAssistant.completeTurn({
+          businessName: record.config.businessName,
+          segment: record.config.segment,
+          customerText: text,
+          knowledge: knowledgeSnapshot,
+          ...(override ? { override } : {})
+        });
+      } catch {
+        llmOutcome = this.llmFailureOutcome();
       }
     }
     this.mutateTenantState(tenantId, () => {
@@ -852,19 +899,17 @@ export class LocalAttendanceService {
             : undefined;
           const response = answer ?? (isGreeting(text) ? currentRecord.config.greeting : undefined) ?? safeSelectedAnswer;
           if (response) {
-            const botMessage: Message = {
-              id: this.createId(),
-              conversationId: conversation.id,
-              role: "BOT",
-              text: response,
-              createdAt: now,
-              deliveryStatus: "SIMULATED",
-              authorName: null
-            };
-            this.pushMessage(botMessage);
-            this.createOutboxEntry(conversation, botMessage);
-            conversation.lastMessagePreview = response;
-            conversation.updatedAt = now;
+            this.appendBotReply(conversation, response, now);
+          } else if (!selectorEligible && llmOutcome?.kind === "reply") {
+            this.appendBotReply(conversation, llmOutcome.text, now);
+          } else if (!selectorEligible && llmOutcome?.kind === "reply_and_handoff") {
+            this.appendBotReply(conversation, llmOutcome.text, now);
+            this.transition(conversation, "WAITING_HUMAN");
+            conversation.waitingSince = now;
+          } else if (!selectorEligible && llmOutcome?.kind === "handoff") {
+            if (llmOutcome.text) this.appendBotReply(conversation, llmOutcome.text, now);
+            this.transition(conversation, "WAITING_HUMAN");
+            conversation.waitingSince = now;
           } else {
             this.transition(conversation, "WAITING_HUMAN");
             conversation.waitingSince = now;
@@ -1062,6 +1107,36 @@ export class LocalAttendanceService {
     const conversationMessages = this.messages.get(message.conversationId);
     if (!conversationMessages) throw new Error("Conversa local sem histórico de mensagens.");
     conversationMessages.push(message);
+  }
+
+  private appendBotReply(conversation: Conversation, text: string, now: string): void {
+    const botMessage: Message = {
+      id: this.createId(),
+      conversationId: conversation.id,
+      role: "BOT",
+      text,
+      createdAt: now,
+      deliveryStatus: "SIMULATED",
+      authorName: null
+    };
+    this.pushMessage(botMessage);
+    this.createOutboxEntry(conversation, botMessage);
+    conversation.lastMessagePreview = text;
+    conversation.updatedAt = now;
+  }
+
+  private llmFailureOutcome(): LlmTurnOutcome {
+    try {
+      return this.llmAssistant?.failureOutcome() ?? {
+        kind: "reply_and_handoff",
+        text: "Não consegui responder agora. Vou transferir você para uma pessoa."
+      };
+    } catch {
+      return {
+        kind: "reply_and_handoff",
+        text: "Não consegui responder agora. Vou transferir você para uma pessoa."
+      };
+    }
   }
 }
 
