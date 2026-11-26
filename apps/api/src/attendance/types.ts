@@ -7,6 +7,14 @@ import type {
 } from "../auth/local-sessions.js";
 import type { InboundSource, NormalizedInboundMessage } from "../meta/inbound-message.js";
 import type { TenantLlmOverride, TenantLlmUpdate } from "../llm/settings.js";
+import type {
+  BusinessProfile,
+  CatalogItem,
+  CustomerOrder,
+  OrderIntegration,
+  OrderStatus,
+  PresentedOrderIntegration
+} from "../ordering/types.js";
 import type { OutboundTextSender } from "../ports/outbound-text-sender.js";
 
 export type { LocalRole, LocalSession, LocalSessionManager, LocalUser } from "../auth/local-sessions.js";
@@ -45,7 +53,15 @@ export interface TenantConfig {
   handoffKeywords: string[];
   assistantMode: AssistantMode;
   version: number;
+  profile: BusinessProfile;
+  catalog: CatalogItem[];
+  orderingEnabled: boolean;
+  orderIntegration?: OrderIntegration;
   llm?: TenantLlmOverride;
+}
+
+export interface PresentedTenantConfig extends Omit<TenantConfig, "orderIntegration"> {
+  orderIntegration?: PresentedOrderIntegration;
 }
 
 export interface Conversation {
@@ -114,6 +130,7 @@ export interface AttendanceSnapshot {
   conversations: Conversation[];
   messages: Message[];
   outbox: OutboxEntry[];
+  orders?: CustomerOrder[];
   processedInboundIds: string[];
 }
 
@@ -135,8 +152,18 @@ export interface UpdateTenantConfigInput {
   handoffKeywords: string[];
   assistantMode?: AssistantMode | undefined;
   llm?: TenantLlmUpdate | null | undefined;
+  profile?: BusinessProfile | undefined;
+  catalog?: CatalogItem[] | undefined;
+  orderingEnabled?: boolean | undefined;
+  orderIntegration?: {
+    webhookUrl?: string | undefined;
+    webhookSecret?: string | null | undefined;
+    webhookSecretConfigured?: boolean | undefined;
+  } | null | undefined;
   version: number;
 }
+
+export type { BusinessProfile, CatalogItem, CustomerOrder, OrderStatus };
 
 export interface SimulateMessageInput {
   customerName: string;

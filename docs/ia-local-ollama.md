@@ -4,7 +4,7 @@
 
 ## Escopo
 
-O seletor local ajuda a identificar qual resposta previamente aprovada pode responder à mensagem. O modelo não redige a resposta ao consumidor, não executa ferramentas e não confirma pedidos, reservas ou agendamentos. Sem uma escolha segura, o fluxo encaminha a conversa para uma pessoa.
+O seletor local ajuda a identificar qual resposta previamente aprovada pode responder à mensagem. Esse caminho não redige texto livre e não monta pedido. Pedidos, quando a empresa tem catálogo e a opção ligada, passam pelo gateway de IA descrito no ADR 0006, não por este classificador. Reserva e agendamento continuam com uma pessoa. Sem uma escolha segura da FAQ, o fluxo encaminha a conversa para uma pessoa.
 
 ## Fluxo e limites
 

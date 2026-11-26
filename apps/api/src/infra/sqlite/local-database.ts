@@ -294,6 +294,23 @@ const migrations = [
       CREATE INDEX attendance_outbox_dispatch_idx
         ON attendance_outbox (status, created_at, ordinal);
     `
+  },
+  {
+    version: 6,
+    name: "customer_orders",
+    sql: `
+      CREATE TABLE attendance_orders (
+        id TEXT PRIMARY KEY,
+        ordinal INTEGER NOT NULL UNIQUE,
+        tenant_id TEXT NOT NULL REFERENCES attendance_tenants(id) ON DELETE CASCADE,
+        conversation_id TEXT NOT NULL REFERENCES attendance_conversations(id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK (status IN (
+          'draft', 'awaiting_confirmation', 'confirmed', 'sent_to_integration', 'cancelled'
+        )),
+        order_json TEXT NOT NULL CHECK (json_valid(order_json))
+      );
+      CREATE INDEX attendance_orders_tenant_idx ON attendance_orders (tenant_id, ordinal);
+    `
   }
 ] as const;
 
@@ -432,6 +449,10 @@ class SqliteAttendanceRepository implements AttendanceStateRepository {
     const processedInboundIds = this.database.connection.prepare(`
       SELECT event_key FROM attendance_processed_inbound ORDER BY ordinal
     `).all() as Array<{ event_key: string }>;
+    const orderRows = this.database.connection.prepare(`
+      SELECT order_json FROM attendance_orders ORDER BY ordinal
+    `).all() as Array<{ order_json: string }>;
+    const orders = orderRows.map((row) => JSON.parse(row.order_json) as AttendanceSnapshot["orders"] extends Array<infer T> | undefined ? T : never);
     const outbox = this.database.connection.prepare(`
       SELECT id, tenant_id, conversation_id, message_id, source_inbound_message_id, source,
         phone_number_id, last_inbound_at, status, blocked_reason, attempt_count,
@@ -483,6 +504,7 @@ class SqliteAttendanceRepository implements AttendanceStateRepository {
         createdAt: String(row.created_at), attemptedAt: row.attempted_at === null ? null : String(row.attempted_at),
         completedAt: row.completed_at === null ? null : String(row.completed_at)
       })),
+      ...(orders.length > 0 ? { orders } : {}),
       processedInboundIds: processedInboundIds.map((row) => row.event_key)
     };
   }
@@ -490,6 +512,7 @@ class SqliteAttendanceRepository implements AttendanceStateRepository {
   save(snapshot: AttendanceSnapshot): void {
     this.database.transaction(() => {
       this.database.connection.exec(`
+        DELETE FROM attendance_orders;
         DELETE FROM attendance_outbox;
         DELETE FROM attendance_processed_inbound;
         DELETE FROM attendance_conversations;
@@ -551,6 +574,14 @@ class SqliteAttendanceRepository implements AttendanceStateRepository {
         INSERT INTO attendance_processed_inbound (event_key, ordinal) VALUES (?, ?)
       `);
       snapshot.processedInboundIds.forEach((eventKey, ordinal) => insertProcessed.run(eventKey, ordinal));
+
+      const insertOrder = this.database.connection.prepare(`
+        INSERT INTO attendance_orders (id, ordinal, tenant_id, conversation_id, status, order_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      (snapshot.orders ?? []).forEach((order, ordinal) => insertOrder.run(
+        order.id, ordinal, order.tenantId, order.conversationId, order.status, JSON.stringify(order)
+      ));
     });
   }
 }

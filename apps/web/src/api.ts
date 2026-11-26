@@ -37,6 +37,57 @@ export interface KnowledgeItem {
   answer: string;
 }
 
+export interface BusinessProfile {
+  address: string;
+  serviceArea: string;
+  hours: string;
+  deliveryEnabled: boolean;
+  pickupEnabled: boolean;
+  deliveryFeeCents: number;
+  paymentMethods: string[];
+  policies: string;
+  persona: string;
+}
+
+export interface CatalogChoice {
+  id: string;
+  name: string;
+  priceCents: number;
+}
+
+export interface CatalogOptionGroup {
+  id: string;
+  name: string;
+  required: boolean;
+  minSelections: number;
+  maxSelections: number;
+  choices: CatalogChoice[];
+}
+
+export interface CatalogItem {
+  id: string;
+  name: string;
+  description: string;
+  priceCents: number;
+  category: string;
+  available: boolean;
+  optionGroups: CatalogOptionGroup[];
+}
+
+export interface OrderIntegration {
+  webhookUrl?: string;
+  webhookSecret?: string | null;
+  webhookSecretConfigured?: boolean;
+}
+
+export interface LlmConfig {
+  provider?: "openrouter" | "local";
+  baseUrl?: string;
+  model?: string;
+  supportsTools?: boolean;
+  apiKey?: string | null;
+}
+
 export interface TenantConfig {
   businessName: string;
   segment: Tenant["segment"];
@@ -45,6 +96,38 @@ export interface TenantConfig {
   handoffKeywords: string[];
   assistantMode: "approved_faq" | "local_ai";
   version: number;
+  profile: BusinessProfile;
+  catalog: CatalogItem[];
+  orderingEnabled: boolean;
+  orderIntegration?: OrderIntegration;
+  llm?: LlmConfig;
+}
+
+export type OrderStatus = "draft" | "awaiting_confirmation" | "confirmed" | "sent_to_integration" | "cancelled";
+
+export interface CustomerOrder {
+  id: string;
+  tenantId: string;
+  conversationId: string;
+  status: OrderStatus;
+  lines: Array<{
+    lineId: string;
+    itemId: string;
+    name: string;
+    quantity: number;
+    unitPriceCents: number;
+    choices: Array<{ name: string; priceCents: number }>;
+    lineTotalCents: number;
+  }>;
+  fulfillment: { method: "delivery" | "pickup"; address: string; notes: string } | null;
+  subtotalCents: number;
+  deliveryFeeCents: number;
+  totalCents: number;
+  currency: "BRL";
+  integrationReference: string | null;
+  integrationError: string | null;
+  createdAt: string;
+  updatedAt: string;
 }
 
 export interface Conversation {

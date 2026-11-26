@@ -48,7 +48,7 @@ describe("SQLite local infrastructure", () => {
     });
     database.attendanceRepository.save(snapshot);
     expect(database.attendanceRepository.load()).toEqual(snapshot);
-    expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 5 });
+    expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 6 });
 
     const qrSnapshot: AttendanceSnapshot = {
       ...snapshot,
@@ -108,6 +108,7 @@ describe("SQLite local infrastructure", () => {
       ALTER TABLE attendance_conversations DROP COLUMN last_inbound_source;
       ALTER TABLE attendance_conversations DROP COLUMN last_inbound_phone_number_id;
       ALTER TABLE attendance_conversations DROP COLUMN last_inbound_at;
+      DROP TABLE IF EXISTS attendance_orders;
       DELETE FROM schema_migrations WHERE version >= 4;
       PRAGMA user_version = 3;
       COMMIT;
@@ -117,7 +118,7 @@ describe("SQLite local infrastructure", () => {
 
     database = new SqliteLocalDatabase(filename);
     expect(database.attendanceRepository.load()).toEqual(snapshot);
-    expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 5 });
+    expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 6 });
   });
 
   it("persists identity hashes and sessions without plaintext credentials", () => {
@@ -255,7 +256,13 @@ function attendanceSnapshot(): AttendanceSnapshot {
       },
       config: {
         businessName: "Tenant One", segment: "outro", greeting: "Olá", knowledge: [],
-        handoffKeywords: ["ajuda"], assistantMode: "approved_faq", version: 1
+        handoffKeywords: ["ajuda"], assistantMode: "approved_faq", version: 1,
+        profile: {
+          address: "", serviceArea: "", hours: "", deliveryEnabled: false, pickupEnabled: false,
+          deliveryFeeCents: 0, paymentMethods: [], policies: "", persona: ""
+        },
+        catalog: [],
+        orderingEnabled: false
       }
     }],
     conversations: [{

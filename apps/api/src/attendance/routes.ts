@@ -37,6 +37,43 @@ const updateConfigSchema = z.strictObject({
   ).max(100),
   handoffKeywords: z.array(z.string().trim().min(1).max(80)).max(50),
   assistantMode: z.enum(["approved_faq", "local_ai"]).optional(),
+  profile: z.strictObject({
+    address: z.string().trim().max(200),
+    serviceArea: z.string().trim().max(200),
+    hours: z.string().trim().max(300),
+    deliveryEnabled: z.boolean(),
+    pickupEnabled: z.boolean(),
+    deliveryFeeCents: z.number().int().min(0).max(1_000_000),
+    paymentMethods: z.array(z.string().trim().min(1).max(40)).max(12),
+    policies: z.string().trim().max(1000),
+    persona: z.string().trim().max(1000)
+  }).optional(),
+  catalog: z.array(z.strictObject({
+    id: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,40}$/),
+    name: z.string().trim().min(1).max(120),
+    description: z.string().trim().max(500),
+    priceCents: z.number().int().min(0).max(1_000_000),
+    category: z.string().trim().max(60),
+    available: z.boolean(),
+    optionGroups: z.array(z.strictObject({
+      id: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,40}$/),
+      name: z.string().trim().min(1).max(80),
+      required: z.boolean(),
+      minSelections: z.number().int().min(0).max(10),
+      maxSelections: z.number().int().min(1).max(10),
+      choices: z.array(z.strictObject({
+        id: z.string().trim().regex(/^[a-z0-9][a-z0-9-]{0,40}$/),
+        name: z.string().trim().min(1).max(80),
+        priceCents: z.number().int().min(-1_000_000).max(1_000_000)
+      })).min(1).max(20)
+    })).max(8)
+  })).max(200).optional(),
+  orderingEnabled: z.boolean().optional(),
+  orderIntegration: z.strictObject({
+    webhookUrl: z.string().trim().max(500).optional(),
+    webhookSecret: z.string().min(8).max(256).regex(/^\S+$/).nullable().optional(),
+    webhookSecretConfigured: z.boolean().optional()
+  }).nullable().optional(),
   llm: z.strictObject({
     provider: z.enum(["openrouter", "local"]).optional(),
     baseUrl: z.string().trim().min(1).max(300).optional(),
@@ -183,6 +220,36 @@ export async function registerAttendanceRoutes(
       type: "attendance.queue.changed.v1",
       occurredAt: new Date().toISOString()
     });
+  });
+
+  app.get<{ Params: unknown }>("/api/v1/tenants/:tenantId/orders", async (request, reply) => {
+    const { tenantId } = body(tenantParamsSchema, request.params);
+    const session = await requireSession(request, sessions);
+    await sessions.requireTenant(session, tenantId);
+    return reply.send({ orders: service.listOrders(tenantId) });
+  });
+
+  app.get<{ Params: unknown }>("/api/v1/tenants/:tenantId/orders/:orderId", async (request, reply) => {
+    const params = body(z.strictObject({
+      tenantId: tenantIdSchema,
+      orderId: z.string().min(1).max(128)
+    }), request.params);
+    const session = await requireSession(request, sessions);
+    await sessions.requireTenant(session, params.tenantId);
+    return reply.send({ order: service.getOrder(params.tenantId, params.orderId) });
+  });
+
+  app.post<{ Params: unknown; Body: unknown }>("/api/v1/tenants/:tenantId/orders/:orderId/status", async (request, reply) => {
+    const params = body(z.strictObject({
+      tenantId: tenantIdSchema,
+      orderId: z.string().min(1).max(128)
+    }), request.params);
+    const session = await requireWrite(request, sessions);
+    await sessions.requireTenant(session, params.tenantId);
+    const { status } = body(z.strictObject({
+      status: z.enum(["cancelled", "sent_to_integration"])
+    }), request.body);
+    return reply.send({ order: service.updateOrderStatus(params.tenantId, params.orderId, status) });
   });
 
   app.put<{ Params: unknown; Body: unknown }>("/api/v1/tenants/:tenantId/config", async (request, reply) => {

@@ -2,7 +2,7 @@
 
 <h1>💬 Plataforma de Atendimento por WhatsApp</h1>
 
-<p>Atendimento inicial multicliente, respostas de FAQ e transferência para pessoas, com painel local.</p>
+<p>Atendimento inicial multicliente: base de conhecimento, pedidos montados pelo assistente e fila humana, com painel operacional.</p>
 
 <p>
   <img src="https://img.shields.io/badge/Node.js-22.13%2B-339933?logo=nodedotjs&logoColor=white" alt="Node.js 22.13 ou superior">
@@ -23,9 +23,10 @@
 - Painel responsivo com login de demonstração, fila, histórico e ações de atendimento humano.
 - Atualização da fila em tempo real por SSE autenticado; o evento só avisa que houve uma mudança, e o painel consulta os dados pelas rotas protegidas.
 - Persistência local em SQLite para empresas, sessões, conversas, mensagens e filas de entrada e saída.
-- Respostas baseadas em FAQ aprovada e encaminhamento para uma pessoa quando não há resposta segura.
-- Classificador opcional com Ollama local: escolhe uma resposta já cadastrada, sem redigir conteúdo novo.
-- Gateway de IA compatível com OpenAI, usado tanto pela OpenRouter quanto por Ollama ou LM Studio.
+- Base de conhecimento por empresa: perfil, FAQ de referência e catálogo com preços e opções.
+- Assistente que interpreta a mensagem, consulta o cardápio e monta um rascunho de pedido. O total é calculado no servidor.
+- Confirmação só depois que o cliente responde ao resumo. Reserva, agendamento e orçamento continuam com uma pessoa.
+- Classificador opcional com Ollama local, restrito à FAQ, e gateway compatível com OpenAI (OpenRouter, Ollama ou LM Studio).
 - Canal WhatsApp com provedor selecionável por empresa: pareamento por QR (Baileys, desligado por padrão) ou esqueleto da API oficial da Meta.
 - Adaptador de envio Cloud API isolado para teste local, **desligado por padrão** e limitado a uma tentativa externa persistida.
 
@@ -67,9 +68,9 @@ flowchart LR
     API --> Fila[Fila inbound local]
     Fila --> Worker[Worker de atendimento]
     Worker --> Estado[(SQLite local)]
-    Worker --> Decisao{Há resposta aprovada?}
-    Decisao -->|Sim| FAQ[Resposta da FAQ]
-    Decisao -->|Não ou requer pessoa| Humano[Fila de atendimento humano]
+    Worker --> Decisao{O que o cliente pediu?}
+    Decisao -->|Fato da base ou pedido| Assistente[Assistente e cardápio]
+    Decisao -->|Reserva, orçamento ou pedido de pessoa| Humano[Fila humana]
     Painel[Painel web] <-->|Rotas autenticadas| API
     Worker -.->|Invalidação sem conteúdo| Painel
     Worker -.->|Opcional, local| Ollama[Ollama]
@@ -78,7 +79,18 @@ flowchart LR
     Gateway -.-> LocalLLM[Ollama ou LM Studio /v1]
 ```
 
-O tenant é obtido pelo `phone_number_id` associado ao canal; o webhook não escolhe o tenant por meio de um `tenant_id` enviado pelo cliente. Mensagens sem texto, pedidos que exigem ação operacional e solicitações por atendente seguem para a fila humana. Perguntas que não coincidem com a FAQ vão para o gateway de IA quando ele está ligado e, sem gateway ou sem resposta segura, também seguem para uma pessoa.
+O tenant é obtido pelo `phone_number_id` associado ao canal; o webhook não escolhe o tenant por meio de um `tenant_id` enviado pelo cliente. A base da empresa (perfil, FAQ e catálogo) é a fonte dos fatos. Com pedidos ligados e itens disponíveis, uma intenção de pedido vai para o assistente, que usa ferramentas para montar o rascunho. Reserva, agendamento, orçamento, pedido explícito de atendente e falha do modelo continuam na fila humana. Sem gateway, o pedido também vai para uma pessoa.
+
+A pizzaria de demonstração já nasce com cardápio (pizzas com tamanho e borda, bebidas e taxa de entrega de R$ 8,00) e com pedidos ligados. A barbearia não tem catálogo: horário e reserva seguem para uma pessoa.
+
+Para experimentar no simulador do painel, com `npm run dev:local` e um modelo no gateway:
+
+1. Entre como `pizzaria@atende.local`.
+2. Em Conversas, simule: `quero uma calabresa grande para entrega na Rua das Acácias, 50`.
+3. O rascunho aparece em Pedidos, com o total calculado no servidor (calabresa grande R$ 63,00 mais a taxa).
+4. Simule `sim` na mesma conversa para confirmar.
+
+`qwen2.5:1.5b` no Ollama serve para o teste local, mas costuma ignorar ferramentas. Nesse caso o gateway pede um JSON e, se isso também falhar, casa o nome do item no cardápio. O total continua saindo do servidor. Um modelo via OpenRouter conversa e usa as ferramentas com bem mais consistência. A resposta ao cliente continua na fila de saída do canal; nada neste fluxo dispara mensagem fora dela.
 
 ## Gateway de IA
 
@@ -124,7 +136,9 @@ O Compose da API já mapeia `host.docker.internal`. Ollama e LM Studio devem esc
 
 `npm run dev:local` lê as variáveis `LLM_*` do `.env` da raiz. `npm run dev:api` carrega o mesmo arquivo. O classificador antigo (`LOCAL_AI_ENABLED`) continua separado e só escolhe uma FAQ pelo endpoint nativo do Ollama.
 
-Se o modelo não aceitar function calling, o gateway repete o pedido sem ferramentas e usa a resposta simples. Timeout ou erro não param a fila: a conversa recebe `LLM_FAILURE_MESSAGE` e, por padrão, segue para uma pessoa (`LLM_FAILURE_ACTION=reply_and_handoff`).
+Se o modelo não aceitar function calling, o gateway repete o pedido sem ferramentas. Fora de um pedido, usa o texto. Num pedido, tenta um JSON de ações e depois um casamento determinístico com o cardápio. Timeout ou erro não param a fila: a conversa recebe `LLM_FAILURE_MESSAGE` e, por padrão, segue para uma pessoa (`LLM_FAILURE_ACTION=reply_and_handoff`).
+
+O pedido confirmado fica na empresa. Se houver `orderIntegration.webhookUrl` na configuração, a API faz um POST com o corpo JSON e o cabeçalho `X-Order-Signature: sha256=<hmac>`. O segredo não volta na leitura. Sem URL, o pedido permanece `confirmed`. Com POST bem-sucedido, vai para `sent_to_integration`. Adaptadores de iFood, Anota AI, Goomer, Saipos ou PDV entram por essa mesma interface `OrderSink`, descrita em [Integração de pedidos](docs/integracao-pedidos.md).
 
 Uma empresa pode sobrescrever provedor, URL, modelo e chave no `PUT /api/v1/tenants/:tenantId/config`, no objeto `llm`. A chave é gravada só para essa empresa e não volta na resposta da API. Ao trocar o provedor, envie de novo URL, modelo e chave.
 
@@ -260,6 +274,8 @@ Os smoke tests usam portas locais `3000` e `5173`; encerre `dev:local` antes de 
 - [Decisão de persistência local com SQLite](docs/adr/0002-persistencia-local-sqlite.md)
 - [Classificador de FAQ com Ollama](docs/ia-local-ollama.md)
 - [Gateway de IA compatível com OpenAI](docs/adr/0004-gateway-llm-compativel-com-openai.md)
+- [Base de conhecimento e pedidos](docs/adr/0006-base-de-conhecimento-e-pedidos.md)
+- [Como plugar um sistema de pedidos](docs/integracao-pedidos.md)
 - [Canal WhatsApp e a rota não oficial](docs/adr/0005-canal-whatsapp-nao-oficial.md)
 - [Contrato do envio WhatsApp de teste](docs/contrato-saida-whatsapp.md)
 - [Gateway local de webhook Cloudflare](docs/cloudflare-webhook-local.md)

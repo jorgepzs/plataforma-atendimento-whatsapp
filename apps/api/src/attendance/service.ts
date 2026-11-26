@@ -28,6 +28,23 @@ import type {
 import type { KnowledgeAnswerSelector } from "./knowledge-classifier.js";
 import type { LlmAssistant, LlmTurnOutcome } from "../llm/assistant.js";
 import { LlmSettingsError, mergeTenantLlmUpdate, presentTenantLlmOverride, copyTenantLlmOverride } from "../llm/settings.js";
+import {
+  assertCatalog,
+  barbeariaProfile,
+  copyCatalog,
+  copyProfile,
+  createWebhookOrderSink,
+  emptyProfile,
+  isOrderIntent,
+  isSchedulingOrQuote,
+  textMentionsItem,
+  OrderSession,
+  pizzariaCatalog,
+  pizzariaProfile,
+  type CustomerOrder,
+  type OrderSink
+} from "../ordering/index.js";
+import { CatalogError } from "../ordering/catalog.js";
 
 export class AttendanceError extends Error {
   readonly statusCode: number;
@@ -53,6 +70,7 @@ interface ServiceOptions {
   repository?: AttendanceStateRepository;
   knowledgeAnswerSelector?: KnowledgeAnswerSelector;
   llmAssistant?: LlmAssistant;
+  orderSink?: OrderSink;
   outbound?: LocalOutboundOptions;
   onCustomerMessage?: (event: CustomerMessageNotice) => void;
   onOutboundMessage?: (event: OutboundMessageNotice) => void;
@@ -133,29 +151,57 @@ function copyTenant(tenant: Tenant): Tenant {
   return { ...tenant };
 }
 
+function copyOrder(order: CustomerOrder): CustomerOrder {
+  return {
+    ...order,
+    lines: order.lines.map((line) => ({ ...line, choices: line.choices.map((choice) => ({ ...choice })) })),
+    fulfillment: order.fulfillment ? { ...order.fulfillment } : null
+  };
+}
+
+function copyIntegration(config: TenantConfig): TenantConfig["orderIntegration"] {
+  const integration = config.orderIntegration;
+  if (!integration?.webhookUrl && !integration?.webhookSecret) return undefined;
+  return {
+    ...(integration.webhookUrl ? { webhookUrl: integration.webhookUrl } : {}),
+    ...(integration.webhookSecret ? { webhookSecret: integration.webhookSecret } : {})
+  };
+}
+
 function copyConfig(config: TenantConfig): TenantConfig {
   const llm = copyTenantLlmOverride(config.llm);
+  const orderIntegration = copyIntegration(config);
   return {
     businessName: config.businessName,
     segment: config.segment,
     greeting: config.greeting,
-    knowledge: config.knowledge.map((entry) => ({ ...entry })),
-    handoffKeywords: [...config.handoffKeywords],
+    knowledge: (config.knowledge ?? []).map((entry) => ({ ...entry })),
+    handoffKeywords: [...(config.handoffKeywords ?? [])],
     assistantMode: config.assistantMode ?? "approved_faq",
     version: config.version,
+    profile: copyProfile(config.profile),
+    catalog: copyCatalog(config.catalog),
+    orderingEnabled: config.orderingEnabled === true,
+    ...(orderIntegration ? { orderIntegration } : {}),
     ...(llm ? { llm } : {})
   };
 }
 
 function presentConfig(config: TenantConfig): TenantConfig {
   const copy = copyConfig(config);
-  if (!copy.llm) return copy;
   const llm = presentTenantLlmOverride(copy.llm);
-  if (!llm) {
-    const { llm: _llm, ...rest } = copy;
-    return rest;
-  }
-  return { ...copy, llm };
+  const { llm: _llm, orderIntegration, ...rest } = copy;
+  const presentedIntegration = orderIntegration
+    ? {
+        ...(orderIntegration.webhookUrl ? { webhookUrl: orderIntegration.webhookUrl } : {}),
+        webhookSecretConfigured: Boolean(orderIntegration.webhookSecret)
+      }
+    : undefined;
+  return {
+    ...rest,
+    ...(presentedIntegration ? { orderIntegration: presentedIntegration } : {}),
+    ...(llm ? { llm } : {})
+  };
 }
 
 function copyConversation(conversation: Conversation): Conversation {
@@ -176,22 +222,17 @@ function normalizeForMatching(text: string): string {
     .trim();
 }
 
-const humanManagedActionPatterns = [
-  /\b(?:quero|gostaria|preciso|pode|poderia|me ajuda a|me ajude a)\b.{0,60}\b(?:pedir|encomendar|comprar|pedido|reserva|reservar|agendar|agendamento|marcar|remarcar|reagendar|cancelar)\b/,
-  /\b(?:fazer|faco|montar|colocar|enviar|realizar|confirmar|acompanhar|alterar|cancelar)\s+(?:(?:um|o|meu|minha)\s+)?(?:pedido|encomenda)\b/,
-  /\b(?:pedido|encomenda)\b.{0,40}\b(?:entrega|delivery|retirada|retirar|acompanhar|alterar|cancelar)\b/,
-  /\b(?:reservar|reserve|agendar|agende|marcar|marque|remarcar|reagendar|cancelar|cancele)\b.{0,60}\b(?:mesa|horario|atendimento|corte|barba)\b/,
-  /\b(?:tem|ha|haveria|teria|consegue|pode|poderia)\b.{0,50}\bmesa\b/,
-  /\b(?:tem|ha|haveria|teria|consegue|pode|poderia)\b.{0,50}\bhorario\b.{0,35}\b(?:disponivel|livre|vaga|corte|barba|marcar|agendar|reservar|fazer|cortar)\b/,
-  /\b(?:horarios? disponiveis|horarios? livres|disponibilidade)\b.{0,50}\b(?:horario|corte|barba|atendimento|mesa|reserva|agendamento)?\b/,
-  /\b(?:me encaixa|consegue me encaixar|queria um horario)\b.{0,60}\b(?:corte|barba|atendimento|cabelo|hoje|amanha|segunda|terca|quarta|quinta|sexta|sabado|domingo)?\b/,
-  /\b(?:quero|gostaria|preciso|pode|poderia|me ajuda a|me ajude a)\b.{0,60}\b(?:orcamento|cotacao)\b/,
-  /\b(?:solicitar|preparar|fazer|faca|fazem|faz|montam|montar|passar|me passar)\s+(?:um\s+)?(?:orcamento|cotacao)\b/
-];
-
-function requiresHumanManagedAction(text: string): boolean {
-  const normalizedText = normalizeForMatching(text);
-  return humanManagedActionPatterns.some((pattern) => pattern.test(normalizedText));
+function assertOrderWebhook(value: string): string {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    throw new AttendanceError(400, "invalid_order_webhook", "URL de webhook inválida.");
+  }
+  if (url.protocol !== "http:" && url.protocol !== "https:" || url.username || url.password) {
+    throw new AttendanceError(400, "invalid_order_webhook", "URL de webhook inválida.");
+  }
+  return url.toString();
 }
 
 function containsHandoffKeyword(text: string, keywords: readonly string[]): boolean {
@@ -240,10 +281,12 @@ export class LocalAttendanceService {
   private readonly repository: AttendanceStateRepository | undefined;
   private readonly knowledgeAnswerSelector: KnowledgeAnswerSelector | undefined;
   private readonly llmAssistant: LlmAssistant | undefined;
+  private readonly orderSink: OrderSink;
   private readonly outbound: LocalOutboundOptions | undefined;
   private readonly onCustomerMessage: ((event: CustomerMessageNotice) => void) | undefined;
   private readonly onOutboundMessage: ((event: OutboundMessageNotice) => void) | undefined;
   private readonly outbox = new Map<string, OutboxEntry>();
+  private readonly orders = new Map<string, CustomerOrder>();
   private readonly changeListeners = new Map<string, Set<() => void>>();
   private workerTimer: ReturnType<typeof setInterval> | undefined;
   private pendingRun: Promise<void> | undefined;
@@ -259,6 +302,7 @@ export class LocalAttendanceService {
     this.repository = options.repository;
     this.knowledgeAnswerSelector = options.knowledgeAnswerSelector;
     this.llmAssistant = options.llmAssistant;
+    this.orderSink = options.orderSink ?? createWebhookOrderSink();
     this.outbound = options.outbound;
     this.onCustomerMessage = options.onCustomerMessage;
     this.onOutboundMessage = options.onOutboundMessage;
@@ -287,6 +331,9 @@ export class LocalAttendanceService {
         knowledge: demo.knowledge,
         handoffKeywords: [...defaultHandoffKeywords],
         assistantMode: "approved_faq",
+        profile: demo.tenant.segment === "pizzaria" ? pizzariaProfile : barbeariaProfile,
+        catalog: demo.tenant.segment === "pizzaria" ? pizzariaCatalog : [],
+        orderingEnabled: demo.tenant.segment === "pizzaria",
         version: 1
       });
     }
@@ -333,6 +380,9 @@ export class LocalAttendanceService {
         knowledge: [],
         handoffKeywords: [...defaultHandoffKeywords],
         assistantMode: "approved_faq",
+        profile: emptyProfile(),
+        catalog: [],
+        orderingEnabled: false,
         version: 1
       };
 
@@ -399,6 +449,34 @@ export class LocalAttendanceService {
         }
         throw error;
       }
+      const profile = input.profile ? copyProfile(input.profile) : copyProfile(record.config.profile);
+      const catalog = input.catalog ? copyCatalog(input.catalog) : copyCatalog(record.config.catalog);
+      if (input.catalog) {
+        try {
+          assertCatalog(catalog);
+        } catch (error) {
+          if (error instanceof CatalogError) throw new AttendanceError(400, "invalid_catalog", error.message);
+          throw error;
+        }
+      }
+      let orderIntegration = copyIntegration(record.config);
+      if (input.orderIntegration === null) orderIntegration = undefined;
+      else if (input.orderIntegration) {
+        const webhookUrl = input.orderIntegration.webhookUrl === undefined
+          ? orderIntegration?.webhookUrl
+          : input.orderIntegration.webhookUrl.trim()
+            ? assertOrderWebhook(input.orderIntegration.webhookUrl.trim())
+            : undefined;
+        const secret = input.orderIntegration.webhookSecret === null
+          ? undefined
+          : input.orderIntegration.webhookSecret ?? orderIntegration?.webhookSecret;
+        if (secret && (secret.length < 8 || /\s/.test(secret))) {
+          throw new AttendanceError(400, "invalid_order_webhook", "O segredo do webhook precisa ter ao menos 8 caracteres.");
+        }
+        orderIntegration = webhookUrl || secret
+          ? { ...(webhookUrl ? { webhookUrl } : {}), ...(secret ? { webhookSecret: secret } : {}) }
+          : undefined;
+      }
       record.config = {
         businessName: input.businessName,
         segment: input.segment,
@@ -406,7 +484,11 @@ export class LocalAttendanceService {
         knowledge: input.knowledge.map((entry) => ({ ...entry })),
         handoffKeywords: [...input.handoffKeywords],
         assistantMode: input.assistantMode ?? record.config.assistantMode ?? "approved_faq",
+        profile,
+        catalog,
+        orderingEnabled: input.orderingEnabled ?? record.config.orderingEnabled,
         version: record.config.version + 1,
+        ...(orderIntegration ? { orderIntegration } : {}),
         ...(llm ? { llm } : {})
       };
       return { tenant: copyTenant(record.tenant), config: presentConfig(record.config) };
@@ -430,6 +512,48 @@ export class LocalAttendanceService {
       conversation: copyConversation(conversation),
       messages: (this.messages.get(conversationId) ?? []).map(copyMessage)
     };
+  }
+
+  listOrders(tenantId: string): CustomerOrder[] {
+    this.getTenantRecord(tenantId);
+    return [...this.orders.values()]
+      .filter((order) => order.tenantId === tenantId)
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))
+      .map(copyOrder);
+  }
+
+  getOrder(tenantId: string, orderId: string): CustomerOrder {
+    this.getTenantRecord(tenantId);
+    const order = this.orders.get(orderId);
+    if (!order || order.tenantId !== tenantId) {
+      throw new AttendanceError(404, "order_not_found", "Pedido não encontrado.");
+    }
+    return copyOrder(order);
+  }
+
+  updateOrderStatus(tenantId: string, orderId: string, status: "cancelled" | "sent_to_integration"): CustomerOrder {
+    const order = this.orders.get(orderId);
+    if (!order || order.tenantId !== tenantId) {
+      throw new AttendanceError(404, "order_not_found", "Pedido não encontrado.");
+    }
+    return this.mutateTenantState(tenantId, () => {
+      const current = this.orders.get(orderId);
+      if (!current || current.tenantId !== tenantId) {
+        throw new AttendanceError(404, "order_not_found", "Pedido não encontrado.");
+      }
+      const allowed = status === "cancelled"
+        ? current.status === "draft" || current.status === "awaiting_confirmation" || current.status === "confirmed"
+        : current.status === "confirmed";
+      if (!allowed) {
+        throw new AttendanceError(409, "invalid_order_status", "Esta mudança de status não é permitida.");
+      }
+      const now = this.now().toISOString();
+      current.status = status;
+      current.updatedAt = now;
+      if (status === "cancelled") current.cancelledAt = now;
+      if (status === "sent_to_integration" && !current.integrationReference) current.integrationReference = "manual";
+      return copyOrder(current);
+    });
   }
 
   listOutbox(tenantId: string): OutboxEntry[] {
@@ -792,18 +916,24 @@ export class LocalAttendanceService {
     const record = this.getTenantRecord(tenantId);
     const text = event.text?.trim() ?? "";
     const textMessage = isTextMessage(event.type, event.text);
+    const existingId = this.conversationKeys.get(`${tenantId}:${customerPhone}`);
+    const existing = existingId ? this.conversations.get(existingId) : undefined;
+    const scheduling = textMessage && isSchedulingOrQuote(text);
+    const orderIntent = textMessage && (isOrderIntent(text) || textMentionsItem(text, record.config.catalog));
+    const orderingActive = record.config.orderingEnabled && record.config.catalog.some((item) => item.available);
+    const openOrder = existing ? this.openOrder(existing.id) : undefined;
+    const routeToOrdering = Boolean(this.llmAssistant) && orderingActive && !scheduling && (orderIntent || Boolean(openOrder));
     const initiallyHandled =
       !textMessage ||
       containsHandoffKeyword(text, record.config.handoffKeywords) ||
-      requiresHumanManagedAction(text);
-    const existingId = this.conversationKeys.get(`${tenantId}:${customerPhone}`);
-    const existing = existingId ? this.conversations.get(existingId) : undefined;
+      scheduling ||
+      (orderIntent && !routeToOrdering);
     const canUseBot = !existing || existing.state === "BOT_ACTIVE" || existing.state === "CLOSED";
-    const exactAnswer = textMessage ? approvedAnswer(text, record.config.knowledge) : undefined;
-    const greeting = textMessage && isGreeting(text) ? record.config.greeting : undefined;
+    const exactAnswer = textMessage && !routeToOrdering ? approvedAnswer(text, record.config.knowledge) : undefined;
+    const greeting = textMessage && !routeToOrdering && isGreeting(text) ? record.config.greeting : undefined;
     let selectedKnowledge: KnowledgeEntry | undefined;
     const selectorEligible =
-      canUseBot && !initiallyHandled && !exactAnswer && !greeting &&
+      canUseBot && !routeToOrdering && !initiallyHandled && !exactAnswer && !greeting &&
       record.config.assistantMode === "local_ai" && this.knowledgeAnswerSelector && record.config.knowledge.length > 0;
     if (selectorEligible && this.knowledgeAnswerSelector) {
       const knowledgeSnapshot = record.config.knowledge.map((entry) => ({ ...entry }));
@@ -822,17 +952,41 @@ export class LocalAttendanceService {
       }
     }
     let llmOutcome: LlmTurnOutcome | undefined;
+    let producedOrder: CustomerOrder | null = null;
+    let plannedConversationId: string | undefined;
     if (canUseBot && !initiallyHandled && !exactAnswer && !greeting && !selectorEligible && this.llmAssistant) {
       const knowledgeSnapshot = record.config.knowledge.map((entry) => ({ ...entry }));
       const override = copyTenantLlmOverride(record.config.llm);
+      plannedConversationId = existing?.id ?? this.createId();
+      const session = orderingActive
+        ? new OrderSession({
+            tenantId,
+            conversationId: plannedConversationId,
+            catalog: copyCatalog(record.config.catalog),
+            profile: copyProfile(record.config.profile),
+            existing: openOrder ? copyOrder(openOrder) : null,
+            customerText: text,
+            now: this.now,
+            createId: this.createId,
+            sink: this.orderSink,
+            ...(record.config.orderIntegration?.webhookUrl ? { webhookUrl: record.config.orderIntegration.webhookUrl } : {}),
+            ...(record.config.orderIntegration?.webhookSecret ? { webhookSecret: record.config.orderIntegration.webhookSecret } : {})
+          })
+        : undefined;
       try {
         llmOutcome = await this.llmAssistant.completeTurn({
           businessName: record.config.businessName,
           segment: record.config.segment,
           customerText: text,
           knowledge: knowledgeSnapshot,
+          profile: copyProfile(record.config.profile),
+          catalog: copyCatalog(record.config.catalog),
+          orderingEnabled: orderingActive,
+          order: openOrder ? copyOrder(openOrder) : null,
+          ...(session ? { session } : {}),
           ...(override ? { override } : {})
         });
+        producedOrder = session?.order() ?? null;
       } catch {
         llmOutcome = this.llmFailureOutcome();
       }
@@ -847,7 +1001,7 @@ export class LocalAttendanceService {
       const now = this.now().toISOString();
 
       if (!conversation) {
-        conversationId = this.createId();
+        conversationId = plannedConversationId ?? this.createId();
         conversation = {
           id: conversationId,
           tenantId,
@@ -900,10 +1054,13 @@ export class LocalAttendanceService {
       });
 
       if (conversation.state === "BOT_ACTIVE") {
+        const currentOrdering = currentRecord.config.orderingEnabled && currentRecord.config.catalog.some((item) => item.available);
+        const currentRoute = Boolean(this.llmAssistant) && currentOrdering && !scheduling && (orderIntent || Boolean(openOrder));
         const shouldHandoff =
           !textMessage ||
           containsHandoffKeyword(text, currentRecord.config.handoffKeywords) ||
-          requiresHumanManagedAction(text);
+          scheduling ||
+          (orderIntent && !currentRoute);
         if (shouldHandoff) {
           this.transition(conversation, "WAITING_HUMAN");
           conversation.waitingSince = now;
@@ -914,7 +1071,10 @@ export class LocalAttendanceService {
                 entry.question === selectedKnowledge?.question && entry.answer === selectedKnowledge.answer
               )?.answer
             : undefined;
-          const response = answer ?? (isGreeting(text) ? currentRecord.config.greeting : undefined) ?? safeSelectedAnswer;
+          const response = routeToOrdering
+            ? undefined
+            : answer ?? (isGreeting(text) ? currentRecord.config.greeting : undefined) ?? safeSelectedAnswer;
+          if (producedOrder) this.orders.set(producedOrder.id, producedOrder);
           if (response) {
             this.appendBotReply(conversation, response, now);
           } else if (!selectorEligible && llmOutcome?.kind === "reply") {
@@ -979,6 +1139,7 @@ export class LocalAttendanceService {
       conversations: [...this.conversations.values()].map(copyConversation),
       messages: [...this.messages.values()].flatMap((items) => items.map(copyMessage)),
       outbox: [...this.outbox.values()].map((entry) => ({ ...entry })),
+      orders: [...this.orders.values()].map(copyOrder),
       processedInboundIds: [...this.processedInboundIds]
     };
   }
@@ -1065,12 +1226,26 @@ export class LocalAttendanceService {
       processedInboundIds.add(id);
     }
 
+    const orders = new Map<string, CustomerOrder>();
+    for (const item of snapshot.orders ?? []) {
+      const order = copyOrder(item);
+      const conversation = conversations.get(order.conversationId);
+      if (
+        !order.id || orders.has(order.id) || !conversation || conversation.tenantId !== order.tenantId ||
+        !["draft", "awaiting_confirmation", "confirmed", "sent_to_integration", "cancelled"].includes(order.status)
+      ) {
+        throw new Error("Snapshot de atendimento contém pedido órfão ou inválido.");
+      }
+      orders.set(order.id, order);
+    }
+
     this.tenants.clear();
     this.channelTenants.clear();
     this.conversations.clear();
     this.conversationKeys.clear();
     this.messages.clear();
     this.outbox.clear();
+    this.orders.clear();
     this.processedInboundIds.clear();
     for (const [id, record] of tenants) this.tenants.set(id, record);
     for (const [channelId, tenantId] of channelTenants) this.channelTenants.set(channelId, tenantId);
@@ -1079,6 +1254,14 @@ export class LocalAttendanceService {
     for (const [id, items] of messages) this.messages.set(id, items);
     for (const [id, entry] of outbox) this.outbox.set(id, entry);
     for (const id of processedInboundIds) this.processedInboundIds.add(id);
+    this.orders.clear();
+    for (const [id, order] of orders) this.orders.set(id, order);
+  }
+
+  private openOrder(conversationId: string): CustomerOrder | undefined {
+    return [...this.orders.values()].find((order) =>
+      order.conversationId === conversationId && (order.status === "draft" || order.status === "awaiting_confirmation")
+    );
   }
 
   private insertTenant(tenant: Tenant, config: TenantConfig): void {
