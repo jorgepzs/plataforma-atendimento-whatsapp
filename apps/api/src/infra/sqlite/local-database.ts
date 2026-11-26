@@ -189,6 +189,111 @@ const migrations = [
       );
       CREATE INDEX attendance_outbox_dispatch_idx ON attendance_outbox (status, created_at, ordinal);
     `
+  },
+  {
+    version: 5,
+    name: "whatsapp_qr_ingress_source",
+    sql: `
+      CREATE TABLE attendance_conversations_v5 (
+        id TEXT PRIMARY KEY,
+        ordinal INTEGER NOT NULL UNIQUE,
+        tenant_id TEXT NOT NULL REFERENCES attendance_tenants(id) ON DELETE CASCADE,
+        customer_name TEXT NOT NULL,
+        customer_phone TEXT NOT NULL,
+        state TEXT NOT NULL CHECK (state IN ('BOT_ACTIVE', 'WAITING_HUMAN', 'HUMAN_ACTIVE', 'CLOSED')),
+        assigned_user_id TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        last_message_preview TEXT NOT NULL,
+        waiting_since TEXT,
+        last_inbound_message_id TEXT,
+        last_inbound_source TEXT CHECK (
+          last_inbound_source IS NULL OR last_inbound_source IN (
+            'META_WEBHOOK', 'LOCAL_SIMULATOR', 'LEGACY_UNKNOWN', 'WHATSAPP_QR'
+          )
+        ),
+        last_inbound_phone_number_id TEXT,
+        last_inbound_at TEXT
+      );
+
+      INSERT INTO attendance_conversations_v5 (
+        id, ordinal, tenant_id, customer_name, customer_phone, state, assigned_user_id,
+        created_at, updated_at, last_message_preview, waiting_since, last_inbound_message_id,
+        last_inbound_source, last_inbound_phone_number_id, last_inbound_at
+      )
+      SELECT
+        id, ordinal, tenant_id, customer_name, customer_phone, state, assigned_user_id,
+        created_at, updated_at, last_message_preview, waiting_since, last_inbound_message_id,
+        last_inbound_source, last_inbound_phone_number_id, last_inbound_at
+      FROM attendance_conversations;
+
+      CREATE TABLE attendance_messages_v5 (
+        id TEXT PRIMARY KEY,
+        ordinal INTEGER NOT NULL UNIQUE,
+        conversation_id TEXT NOT NULL REFERENCES attendance_conversations_v5(id) ON DELETE CASCADE,
+        role TEXT NOT NULL CHECK (role IN ('CUSTOMER', 'BOT', 'ATTENDANT')),
+        text TEXT NOT NULL,
+        created_at TEXT NOT NULL,
+        delivery_status TEXT NOT NULL CHECK (delivery_status IN (
+          'RECEIVED', 'SIMULATED', 'PENDING', 'SENDING', 'ACCEPTED', 'BLOCKED', 'HTTP_ERROR', 'INDETERMINATE'
+        )),
+        author_name TEXT
+      );
+
+      INSERT INTO attendance_messages_v5 (
+        id, ordinal, conversation_id, role, text, created_at, delivery_status, author_name
+      )
+      SELECT id, ordinal, conversation_id, role, text, created_at, delivery_status, author_name
+      FROM attendance_messages;
+
+      CREATE TABLE attendance_outbox_v5 (
+        id TEXT PRIMARY KEY,
+        ordinal INTEGER NOT NULL UNIQUE,
+        tenant_id TEXT NOT NULL REFERENCES attendance_tenants(id) ON DELETE CASCADE,
+        conversation_id TEXT NOT NULL REFERENCES attendance_conversations_v5(id) ON DELETE CASCADE,
+        message_id TEXT NOT NULL UNIQUE REFERENCES attendance_messages_v5(id) ON DELETE CASCADE,
+        source_inbound_message_id TEXT,
+        source TEXT CHECK (source IS NULL OR source IN (
+          'META_WEBHOOK', 'LOCAL_SIMULATOR', 'LEGACY_UNKNOWN', 'WHATSAPP_QR'
+        )),
+        phone_number_id TEXT,
+        last_inbound_at TEXT,
+        status TEXT NOT NULL CHECK (status IN (
+          'SIMULATED', 'PENDING', 'SENDING', 'ACCEPTED', 'BLOCKED', 'HTTP_ERROR', 'INDETERMINATE'
+        )),
+        blocked_reason TEXT,
+        attempt_count INTEGER NOT NULL CHECK (attempt_count BETWEEN 0 AND 1),
+        provider_message_id TEXT,
+        result_code TEXT,
+        created_at TEXT NOT NULL,
+        attempted_at TEXT,
+        completed_at TEXT
+      );
+
+      INSERT INTO attendance_outbox_v5 (
+        id, ordinal, tenant_id, conversation_id, message_id, source_inbound_message_id, source,
+        phone_number_id, last_inbound_at, status, blocked_reason, attempt_count,
+        provider_message_id, result_code, created_at, attempted_at, completed_at
+      )
+      SELECT
+        id, ordinal, tenant_id, conversation_id, message_id, source_inbound_message_id, source,
+        phone_number_id, last_inbound_at, status, blocked_reason, attempt_count,
+        provider_message_id, result_code, created_at, attempted_at, completed_at
+      FROM attendance_outbox;
+
+      DROP TABLE attendance_outbox;
+      DROP TABLE attendance_messages;
+      DROP TABLE attendance_conversations;
+
+      ALTER TABLE attendance_conversations_v5 RENAME TO attendance_conversations;
+      ALTER TABLE attendance_messages_v5 RENAME TO attendance_messages;
+      ALTER TABLE attendance_outbox_v5 RENAME TO attendance_outbox;
+
+      CREATE UNIQUE INDEX attendance_conversations_one_per_customer_idx
+        ON attendance_conversations (tenant_id, customer_phone);
+      CREATE INDEX attendance_outbox_dispatch_idx
+        ON attendance_outbox (status, created_at, ordinal);
+    `
   }
 ] as const;
 

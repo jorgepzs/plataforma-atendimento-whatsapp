@@ -11,7 +11,7 @@ export type InboundMessageType =
   | "unknown";
 
 /** Set by a trusted ingress adapter, never accepted from an HTTP message body. */
-export type InboundSource = "META_WEBHOOK" | "LOCAL_SIMULATOR" | "LEGACY_UNKNOWN";
+export type InboundSource = "META_WEBHOOK" | "LOCAL_SIMULATOR" | "LEGACY_UNKNOWN" | "WHATSAPP_QR";
 
 export interface NormalizedInboundMessage {
   provider: "META_WHATSAPP";

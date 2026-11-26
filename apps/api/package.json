@@ -13,14 +13,18 @@
     "migrate": "node --env-file=../../.env --import tsx src/infra/postgres/migrate.ts"
   },
   "dependencies": {
+    "@whiskeysockets/baileys": "^6.7.24",
     "fastify": "^5.6.0",
     "fastify-raw-body": "^5.0.0",
     "pg": "^8.16.0",
+    "pino": "^9.6.0",
+    "qrcode": "^1.5.4",
     "zod": "^4.1.0"
   },
   "devDependencies": {
     "@types/node": "^22.0.0",
     "@types/pg": "^8.15.0",
+    "@types/qrcode": "^1.5.5",
     "tsx": "^4.20.0",
     "typescript": "^5.9.0",
     "vitest": "^5.0.3"

@@ -48,7 +48,21 @@ describe("SQLite local infrastructure", () => {
     });
     database.attendanceRepository.save(snapshot);
     expect(database.attendanceRepository.load()).toEqual(snapshot);
-    expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 4 });
+    expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 5 });
+
+    const qrSnapshot: AttendanceSnapshot = {
+      ...snapshot,
+      conversations: [{
+        ...snapshot.conversations[0]!,
+        lastInboundSource: "WHATSAPP_QR",
+        lastInboundMessageId: "qr-message",
+        lastInboundPhoneNumberId: "phone-1",
+        lastInboundAt: "2026-10-03T10:00:00.000Z"
+      }]
+    };
+    database.attendanceRepository.save(qrSnapshot);
+    expect(database.attendanceRepository.load()?.conversations[0]?.lastInboundSource).toBe("WHATSAPP_QR");
+    database.attendanceRepository.save(snapshot);
 
     const invalidSnapshot: AttendanceSnapshot = {
       ...snapshot,
@@ -94,7 +108,7 @@ describe("SQLite local infrastructure", () => {
       ALTER TABLE attendance_conversations DROP COLUMN last_inbound_source;
       ALTER TABLE attendance_conversations DROP COLUMN last_inbound_phone_number_id;
       ALTER TABLE attendance_conversations DROP COLUMN last_inbound_at;
-      DELETE FROM schema_migrations WHERE version = 4;
+      DELETE FROM schema_migrations WHERE version >= 4;
       PRAGMA user_version = 3;
       COMMIT;
       PRAGMA foreign_keys = ON;
@@ -103,7 +117,7 @@ describe("SQLite local infrastructure", () => {
 
     database = new SqliteLocalDatabase(filename);
     expect(database.attendanceRepository.load()).toEqual(snapshot);
-    expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 4 });
+    expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 5 });
   });
 
   it("persists identity hashes and sessions without plaintext credentials", () => {

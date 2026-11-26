@@ -1,0 +1,16 @@
+# Perfil do canal WhatsApp não oficial.
+# Uso: docker compose -f compose.yaml -f compose.whatsapp.yaml up -d --build
+# A conversa fica no SQLite do volume. O Postgres do compose base pode continuar no ar,
+# mas a API não usa DATABASE_URL neste perfil.
+services:
+  api:
+    environment:
+      DATABASE_URL: ""
+      ENABLE_LOCAL_DEMO: "false"
+      WHATSAPP_CHANNEL_ENABLED: "true"
+      WHATSAPP_PROVIDER: unofficial_qr
+      LOCAL_SQLITE_PATH: /data/whatsapp/attendance.sqlite
+      WHATSAPP_SESSION_DIR: /data/whatsapp/sessions
+      WHATSAPP_STATE_DIR: /data/whatsapp/state
+    volumes:
+      - whatsapp-data:/data/whatsapp

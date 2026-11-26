@@ -14,7 +14,8 @@ button,input,select,textarea{font:inherit}button{cursor:pointer}button:disabled{
 .mobile-logout{display:none}
 @media(max-width:700px){.mobile-logout{display:grid}.topbar-right{gap:5px}}
 .workspace-switch:focus-within{outline:3px solid #87b9a0;outline-offset:2px}.metrics-grid{grid-template-columns:repeat(5,minmax(0,1fr))}
-#inicio,#atendimento,#configuracao,#simulador{scroll-margin-top:72px}
+#inicio,#atendimento,#configuracao,#whatsapp,#simulador{scroll-margin-top:72px}
 @media(max-width:1050px){.metrics-grid{grid-template-columns:repeat(2,minmax(0,1fr))}}
-@media(max-width:700px){#inicio,#atendimento,#configuracao,#simulador{scroll-margin-top:110px}}
+@media(max-width:700px){#inicio,#atendimento,#configuracao,#whatsapp,#simulador{scroll-margin-top:110px}}
 .poll-indicator.realtime-reconnecting{color:#9a783d}.poll-indicator.realtime-reconnecting .status-dot{color:#d49a39}.poll-indicator.realtime-connecting{color:#7d8a7d}.poll-indicator.realtime-connecting .status-dot{color:#9ba59b}
+.whatsapp-panel{margin-top:20px}.whatsapp-qr{display:block;width:220px;height:220px;margin:8px 0 14px;padding:8px;background:#fff;border:1px solid #e3e8e2;border-radius:12px}.whatsapp-actions{justify-content:flex-start;margin:8px 0 4px}.check-row{display:flex;align-items:center;gap:8px;margin:14px 0 4px;font-size:11px;color:#535d54}.check-row input{width:auto}

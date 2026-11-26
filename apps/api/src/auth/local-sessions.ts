@@ -50,6 +50,10 @@ const allowedOrigins = new Set([
   "http://127.0.0.1:3000", "http://localhost:3000"
 ]);
 
+export function allowPanelOrigins(origins: readonly string[]): void {
+  for (const origin of origins) allowedOrigins.add(origin);
+}
+
 export function requireLocalOrigin(request: FastifyRequest): void {
   const origin = request.headers.origin;
   if (origin && !allowedOrigins.has(origin)) {

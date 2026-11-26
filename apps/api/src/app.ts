@@ -11,12 +11,17 @@ import { MemoryInboundEventStore } from "./infra/memory/memory-inbound-event-sto
 import { LocalSessionManager, LocalHttpError } from "./auth/local-sessions.js";
 import { registerLocalAuthRoutes } from "./auth/local-auth-routes.js";
 import { LocalAttendanceService, AttendanceError } from "./attendance/service.js";
+import type { CustomerMessageNotice, OutboundMessageNotice } from "./attendance/types.js";
 import { registerAttendanceRoutes } from "./attendance/routes.js";
 import { SqliteLocalDatabase } from "./infra/sqlite/local-database.js";
 import { SqliteInboundEventStore } from "./infra/sqlite/sqlite-inbound-event-store.js";
 import { OllamaKnowledgeAnswerSelector, type KnowledgeAnswerSelector } from "./attendance/knowledge-classifier.js";
+import { createLlmAssistant, isPrivateLlmHost, OpenAiCompatibleChatClient, type LlmChatClient } from "./llm/index.js";
 import { CloudApiTextSender } from "./infra/meta/cloud-api-text-sender.js";
 import type { OutboundTextSender } from "./ports/outbound-text-sender.js";
+import { allowPanelOrigins } from "./auth/local-sessions.js";
+import { createWhatsAppChannel, type WhatsAppChannel } from "./whatsapp/channel.js";
+import { registerWhatsAppRoutes } from "./whatsapp/routes.js";
 
 declare module "fastify" {
   interface FastifyInstance { localAttendanceService?: LocalAttendanceService }
@@ -28,6 +33,7 @@ export interface BuildAppOptions {
   logger?: boolean;
   localDatabase?: SqliteLocalDatabase;
   knowledgeAnswerSelector?: KnowledgeAnswerSelector;
+  llmClient?: LlmChatClient;
   outboundSender?: OutboundTextSender;
 }
 
@@ -50,6 +56,14 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   }
   if (options.localDatabase && (!options.config.localDemoEnabled || !(options.store instanceof SqliteInboundEventStore) || options.store.database !== options.localDatabase)) {
     throw new Error("O banco local deve pertencer ao store SQLite e ao atendimento local habilitado.");
+  }
+  if (options.config.whatsapp.enabled && (
+    !(options.store instanceof SqliteInboundEventStore) ||
+    !(options.localDatabase instanceof SqliteLocalDatabase) ||
+    options.store.database !== options.localDatabase ||
+    !options.config.whatsapp.sessionDir
+  )) {
+    throw new Error("O canal WhatsApp exige SQLite local e um diretório de sessão.");
   }
   if (options.config.whatsappOutboundEnabled && (
     !options.config.localDemoEnabled || options.config.nodeEnv === "production" || options.config.databaseUrl ||
@@ -74,6 +88,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
                 "req.headers.x-csrf-token",
                 "res.headers.set-cookie",
                 "req.body.password",
+                "req.body.llm.apiKey",
+                "req.body.metaAccessToken",
                 "req.headers.x-hub-signature-256",
                 "req.body.entry[*].changes[*].value.contacts",
                 "req.body.entry[*].changes[*].value.messages"
@@ -91,9 +107,35 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     runFirst: true
   });
 
-  const webhookService = new MetaWebhookService(options.store);
+  const llmSettings = options.config.llm;
+  const llmClient = llmSettings
+    ? options.llmClient ?? new OpenAiCompatibleChatClient({
+        onLog: (event) => {
+          const payload = {
+            event: event.event,
+            provider: event.provider,
+            model: event.model,
+            attempt: event.attempt,
+            ...(event.statusCode !== undefined ? { statusCode: event.statusCode } : {}),
+            ...(event.toolsDegraded !== undefined ? { toolsDegraded: event.toolsDegraded } : {})
+          };
+          if (event.level === "warn") app.log.warn(payload, "Falha no provedor de IA.");
+          else app.log.info(payload, "Provedor de IA respondeu sem ferramentas.");
+        }
+      })
+    : undefined;
+  if (llmSettings?.provider === "local") {
+    app.log.warn(
+      { model: llmSettings.model, privateHost: isPrivateLlmHost(llmSettings.baseUrl) },
+      "IA local ativa. A máquina do modelo precisa permanecer ligada; OpenRouter é a opção indicada para produção."
+    );
+  }
 
-  if (options.config.localDemoEnabled && (options.store instanceof MemoryInboundEventStore || options.store instanceof SqliteInboundEventStore)) {
+  const webhookService = new MetaWebhookService(options.store);
+  allowPanelOrigins(options.config.whatsapp.panelOrigins);
+
+  const attendanceEnabled = Boolean(options.config.localDemoEnabled || options.config.whatsapp.enabled);
+  if (attendanceEnabled && (options.store instanceof MemoryInboundEventStore || options.store instanceof SqliteInboundEventStore)) {
     const outboundSender = options.config.whatsappOutboundEnabled
       ? options.outboundSender ?? new CloudApiTextSender({
           enabled: true,
@@ -102,6 +144,10 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
           accessToken: options.config.whatsappOutboundAccessToken!
         })
       : undefined;
+    const channelBridge: {
+      customer?: (event: CustomerMessageNotice) => void;
+      outbound?: (event: OutboundMessageNotice) => void;
+    } = {};
     const service = new LocalAttendanceService(options.store, {
       ...(options.localDatabase ? { repository: options.localDatabase.attendanceRepository } : {}),
       outbound: {
@@ -115,9 +161,34 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       },
       ...(options.config.localAiEnabled && options.config.localAiModel
         ? { knowledgeAnswerSelector: options.knowledgeAnswerSelector ?? new OllamaKnowledgeAnswerSelector({ model: options.config.localAiModel }) }
-        : {})
+        : {}),
+      ...(llmSettings && llmClient ? { llmAssistant: createLlmAssistant(llmClient, llmSettings) } : {}),
+      onCustomerMessage: (event) => channelBridge.customer?.(event),
+      onOutboundMessage: (event) => channelBridge.outbound?.(event)
     });
     const sessions = new LocalSessionManager(Date.now, options.localDatabase?.identityRepository);
+    let channel: WhatsAppChannel | undefined;
+    if (options.config.whatsapp.enabled && options.store instanceof SqliteInboundEventStore) {
+      channel = createWhatsAppChannel({
+        config: options.config.whatsapp,
+        graphApiVersion: options.config.metaGraphApiVersion,
+        resolveChannelId: (tenantId) => {
+          try {
+            return service.getConfig(tenantId).tenant.channelPhoneNumberId;
+          } catch {
+            return undefined;
+          }
+        },
+        enqueue: (message) => options.store.enqueue(message),
+        onDelivery: (update) => service.markDelivery(update.tenantId, update.messageId, update),
+        log: (level, payload, message) => {
+          if (level === "warn") app.log.warn(payload, message);
+          else app.log.info(payload, message);
+        }
+      });
+      channelBridge.customer = (event) => channel?.handleCustomerMessage(event);
+      channelBridge.outbound = (event) => channel?.handleOutbound(event);
+    }
     app.decorate("localAttendanceService", service);
     app.addHook("onRequest", async (request, reply) => {
       if (request.url.startsWith("/api/v1/")) reply.header("cache-control", "no-store");
@@ -136,8 +207,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         throw error;
       }
     } : undefined);
-    app.addHook("onReady", async () => { service.startWorker(); });
-    app.addHook("preClose", async () => { await service.stopWorker(); });
+    await registerWhatsAppRoutes(app, sessions, channel);
+    app.addHook("onReady", async () => { service.startWorker(); if (channel) await channel.start(); });
+    app.addHook("preClose", async () => { await service.stopWorker(); if (channel) await channel.stop(); });
     app.addHook("onClose", async () => { sessions.close(); });
   }
 
@@ -147,7 +219,9 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     options.store,
     options.config.localDemoEnabled ?? false,
     options.config.localAiEnabled,
-    options.config.whatsappOutboundEnabled
+    options.config.whatsappOutboundEnabled,
+    llmSettings ? { provider: llmSettings.provider, model: llmSettings.model } : null,
+    options.config.whatsapp.enabled ? { provider: options.config.whatsapp.provider } : null
   );
   await registerMetaWebhookRoutes(app, options.config, webhookService);
 

@@ -6,6 +6,7 @@ import type {
   LocalUser
 } from "../auth/local-sessions.js";
 import type { InboundSource, NormalizedInboundMessage } from "../meta/inbound-message.js";
+import type { TenantLlmOverride, TenantLlmUpdate } from "../llm/settings.js";
 import type { OutboundTextSender } from "../ports/outbound-text-sender.js";
 
 export type { LocalRole, LocalSession, LocalSessionManager, LocalUser } from "../auth/local-sessions.js";
@@ -44,6 +45,7 @@ export interface TenantConfig {
   handoffKeywords: string[];
   assistantMode: AssistantMode;
   version: number;
+  llm?: TenantLlmOverride;
 }
 
 export interface Conversation {
@@ -132,6 +134,7 @@ export interface UpdateTenantConfigInput {
   knowledge: KnowledgeEntry[];
   handoffKeywords: string[];
   assistantMode?: AssistantMode | undefined;
+  llm?: TenantLlmUpdate | null | undefined;
   version: number;
 }
 
@@ -145,5 +148,27 @@ export interface SimulateMessageInput {
 export interface SimulateMessageResult {
   eventId: string;
   status: "PENDING" | "DUPLICATE";
+}
+
+export interface CustomerMessageNotice {
+  tenantId: string;
+  phone: string;
+  text: string;
+  at: string;
+  messageId: string;
+  source: InboundSource | null;
+}
+
+export interface OutboundMessageNotice {
+  tenantId: string;
+  conversationId: string;
+  messageId: string;
+  customerPhone: string;
+  text: string;
+  role: "BOT" | "ATTENDANT";
+  lastInboundAt: string | null;
+  inboundMessageId: string | null;
+  deliveryStatus: OutboundStatus;
+  source: InboundSource | null;
 }
 
