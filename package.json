@@ -3,7 +3,7 @@
   "version": "0.1.0",
   "private": true,
   "scripts": {
-    "install:all": "npm install --prefix apps/api && npm install --prefix apps/web",
+    "install:all": "node scripts/install-all.mjs",
     "dev:api": "npm run dev --prefix apps/api",
     "dev:web": "npm run dev --prefix apps/web",
     "dev:local": "node scripts/dev-local.mjs",
@@ -19,7 +19,7 @@
     "meta:tunnel": "node scripts/cloudflare-local.mjs",
     "meta:tunnel:named": "node scripts/cloudflare-local.mjs --named",
     "meta:tunnel:local-managed": "node scripts/cloudflare-local.mjs --local-managed",
-    "test:meta-config": "node --test scripts/meta-local.test.mjs scripts/meta-verify-channel.test.mjs scripts/meta-webhook-config.test.mjs scripts/cloudflare-local.test.mjs",
+    "test:meta-config": "node --test scripts/meta-local.test.mjs scripts/meta-verify-channel.test.mjs scripts/meta-webhook-config.test.mjs scripts/cloudflare-local.test.mjs scripts/local-env.test.mjs",
     "dev:postgres": "node scripts/dev-local.mjs --postgres",
     "test:postgres": "node scripts/dev-local.mjs --postgres --smoke",
     "db:setup": "node scripts/postgres-local.mjs setup && npm run db:migrate && npm run db:seed",

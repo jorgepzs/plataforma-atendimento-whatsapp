@@ -56,12 +56,75 @@ export function phoneToJid(phone: string): string {
   return `${phone}@s.whatsapp.net`;
 }
 
+export interface ChatAddress {
+  /** JID exato para envio, leitura e presença. `@lid` não vira `@s.whatsapp.net`. */
+  replyJid: string;
+  /** Chave estável de opt-out e limite. Telefone quando conhecido; senão `lid:<id>`. */
+  contactId: string;
+  phone: string | null;
+  aliases: string[];
+}
+
+function jidUser(jid: string): { user: string; server: string } | undefined {
+  const at = jid.indexOf("@");
+  if (at <= 0) return undefined;
+  const server = jid.slice(at + 1).split(":")[0] ?? "";
+  const user = jid.slice(0, at).split(":")[0]?.split("_")[0] ?? "";
+  if (!user || !server) return undefined;
+  return { user, server };
+}
+
 export function phoneFromJid(jid: string): string | undefined {
-  if (jid.endsWith("@g.us") || jid.endsWith("@broadcast") || jid.endsWith("@newsletter") || jid.startsWith("status@")) {
+  const parsed = jidUser(jid);
+  if (!parsed || parsed.server === "lid" || parsed.server === "g.us" || parsed.server === "broadcast" || parsed.server === "newsletter") {
     return undefined;
   }
-  const user = jid.split("@")[0]?.split(":")[0] ?? "";
-  return /^[1-9]\d{7,14}$/.test(user) ? user : undefined;
+  if (jid.startsWith("status@")) return undefined;
+  return digitsPhone(parsed.user);
+}
+
+export function chatAddressFromInbound(remoteJid: string, altPhoneJid?: string): ChatAddress | undefined {
+  const remote = jidUser(remoteJid.trim());
+  if (!remote || remote.server === "g.us" || remote.server === "broadcast" || remote.server === "newsletter") return undefined;
+  const server = remote.server === "c.us" ? "s.whatsapp.net" : remote.server;
+  if (server !== "lid" && server !== "s.whatsapp.net") return undefined;
+  if (server === "s.whatsapp.net" && !digitsPhone(remote.user)) return undefined;
+  if (server === "lid" && !/^[1-9]\d{5,24}$/.test(remote.user)) return undefined;
+  const replyJid = `${server === "s.whatsapp.net" ? digitsPhone(remote.user) : remote.user}@${server}`;
+  const alt = altPhoneJid?.trim()
+    ? jidUser(altPhoneJid.includes("@") ? altPhoneJid : `${altPhoneJid}@s.whatsapp.net`)
+    : undefined;
+  const phoneFromAlt = alt?.server === "s.whatsapp.net" || alt?.server === "c.us" ? digitsPhone(alt.user) : undefined;
+  const phone = server === "s.whatsapp.net" ? digitsPhone(remote.user) ?? null : phoneFromAlt ?? null;
+  const lidId = server === "lid" ? `lid:${remote.user}` : null;
+  const contactId = phone ?? lidId;
+  if (!contactId) return undefined;
+  const aliases = lidId && phone && lidId !== phone ? [lidId] : [];
+  return { replyJid, contactId, phone, aliases };
+}
+
+export function destinationJid(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (trimmed.includes("@")) {
+    const address = chatAddressFromInbound(trimmed);
+    return address?.replyJid;
+  }
+  if (trimmed.startsWith("lid:")) {
+    const user = trimmed.slice(4);
+    return /^[1-9]\d{5,24}$/.test(user) ? `${user}@lid` : undefined;
+  }
+  const phone = digitsPhone(trimmed);
+  return phone ? phoneToJid(phone) : undefined;
+}
+
+export function contactIdFrom(value: string): string | undefined {
+  const trimmed = value.trim();
+  if (trimmed.startsWith("lid:")) {
+    const user = trimmed.slice(4);
+    return /^[1-9]\d{5,24}$/.test(user) ? `lid:${user}` : undefined;
+  }
+  if (trimmed.includes("@")) return chatAddressFromInbound(trimmed)?.contactId;
+  return digitsPhone(trimmed);
 }
 
 export function maskPhone(phone: string): string {

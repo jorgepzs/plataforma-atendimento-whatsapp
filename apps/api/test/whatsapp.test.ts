@@ -15,7 +15,7 @@ import { acquireDirectoryLock } from "../src/whatsapp/session-lock.js";
 import { defaultAntiBanSettings, disabledWhatsAppConfig } from "../src/whatsapp/settings.js";
 import { ChannelStateStore } from "../src/whatsapp/state-store.js";
 import { isOptOutMessage, splitOutboundText } from "../src/whatsapp/text.js";
-import type { WhatsAppStatus, WhatsAppTransport, TransportSendResult } from "../src/whatsapp/types.js";
+import type { WhatsAppInboundMessage, WhatsAppStatus, WhatsAppTransport, TransportSendResult } from "../src/whatsapp/types.js";
 import { MemoryInboundEventStore } from "../src/infra/memory/memory-inbound-event-store.js";
 import { loadConfig } from "../src/config.js";
 
@@ -244,9 +244,9 @@ describe("provider guard", () => {
     });
     expect(outcome).toMatchObject({ ok: true, chunks: 1 });
     expect(clock.sleeps[0]).toBeGreaterThanOrEqual(defaultAntiBanSettings().minDelayMs);
-    expect(transport.reads).toEqual([{ tenantId: "pizzaria-demo", to: "5511999990000", messageId: "inbound-1" }]);
+    expect(transport.reads).toEqual([{ tenantId: "pizzaria-demo", to: "5511999990000@s.whatsapp.net", messageId: "inbound-1" }]);
     expect(transport.presence.map((item) => item.presence)).toEqual(["composing", "paused"]);
-    expect(transport.sent).toEqual([{ tenantId: "pizzaria-demo", to: "5511999990000", text: "Funcionamos das 18h às 23h." }]);
+    expect(transport.sent).toEqual([{ tenantId: "pizzaria-demo", to: "5511999990000@s.whatsapp.net", text: "Funcionamos das 18h às 23h." }]);
   });
 
   it("sends one opt-out confirmation and then blocks the bot", async () => {
@@ -316,7 +316,7 @@ describe("provider guard", () => {
 describe("baileys transport", () => {
   it("normalizes inbound messages, exposes the QR and reconnects only transient failures", async () => {
     const sockets: FakeSocket[] = [];
-    const inbound: Array<{ from: string; text?: string; type: string }> = [];
+    const inbound: Array<{ from: string; text?: string; type: string; replyJid: string }> = [];
     const statuses: string[] = [];
     const clock = clockAt("2026-06-15T15:00:00.000Z");
     const transport = new BaileysWhatsAppTransport({
@@ -326,7 +326,12 @@ describe("baileys transport", () => {
       reconnectBaseMs: 2_000,
       reconnectMaxMs: 60_000,
       toDataUrl: async (qr) => `data:text,${qr}`,
-      onInbound: (message) => inbound.push({ from: message.from, ...(message.text ? { text: message.text } : {}), type: message.type }),
+      onInbound: (message) => inbound.push({
+        from: message.from,
+        ...(message.text ? { text: message.text } : {}),
+        type: message.type,
+        replyJid: message.replyJid
+      }),
       onStatus: (status) => statuses.push(status.status)
     });
     await transport.connect("pizzaria-demo");
@@ -348,7 +353,7 @@ describe("baileys transport", () => {
         message: { conversation: "grupo" }
       }]
     });
-    expect(inbound).toEqual([{ from: "5511999990000", text: "Oi", type: "text" }]);
+    expect(inbound).toEqual([{ from: "5511999990000", text: "Oi", type: "text", replyJid: "5511999990000@s.whatsapp.net" }]);
     expect(transport.status("pizzaria-demo").phoneNumber).toBe("5511977770000");
 
     sockets[0]?.emit("connection.update", { connection: "close", lastDisconnect: { error: { output: { statusCode: 428 } } } });
@@ -399,12 +404,107 @@ class FakeSocket implements BaileysLikeSocket {
     for (const listener of this.listeners.get(event) ?? []) listener(payload);
   }
 
-  async sendMessage(): Promise<{ key?: { id?: string } }> { return { key: { id: "out" } }; }
+  readonly destinations: string[] = [];
+  failSend: string | null = null;
+  async sendMessage(jid: string): Promise<{ key?: { id?: string } }> {
+    this.destinations.push(jid);
+    if (this.failSend) throw new Error(this.failSend);
+    return { key: { id: "out" } };
+  }
   async sendPresenceUpdate(): Promise<void> {}
-  async readMessages(): Promise<void> {}
+  readonly reads: Array<{ remoteJid: string; id: string }> = [];
+  async readMessages(keys: Array<{ remoteJid: string; id: string }>): Promise<void> {
+    this.reads.push(...keys);
+  }
   async logout(): Promise<void> {}
   end(): void {}
 }
+
+describe("LID addressing", () => {
+  it("replies to the original @lid and keeps the phone only for the contact", async () => {
+    const sockets: FakeSocket[] = [];
+    const inbound: WhatsAppInboundMessage[] = [];
+    const transport = new BaileysWhatsAppTransport({
+      sessionDir: tempDir(),
+      factory: { create: async () => { const socket = new FakeSocket(); sockets.push(socket); return socket; } },
+      clock: clockAt("2026-06-15T15:00:00.000Z"),
+      reconnectBaseMs: 2_000,
+      reconnectMaxMs: 60_000,
+      onInbound: (message) => inbound.push(message),
+      onStatus: () => undefined
+    });
+    await transport.connect("pizzaria-demo");
+    sockets[0]?.emit("connection.update", { connection: "open" });
+    await transport.whenIdle();
+    sockets[0]?.emit("messages.upsert", {
+      type: "notify",
+      messages: [{
+        key: {
+          remoteJid: "210281665921110@lid",
+          senderPn: "5511999990000@s.whatsapp.net",
+          fromMe: false,
+          id: "lid-1"
+        },
+        message: { conversation: "oi" },
+        messageTimestamp: 1_700_000_000
+      }]
+    });
+    expect(inbound[0]).toMatchObject({
+      from: "5511999990000",
+      phone: "5511999990000",
+      replyJid: "210281665921110@lid",
+      aliases: ["lid:210281665921110"]
+    });
+    const sent = await transport.sendText("pizzaria-demo", { to: inbound[0]!.replyJid, text: "Olá" });
+    expect(sent).toEqual({ ok: true, providerMessageId: "out" });
+    expect(sockets[0]?.destinations).toEqual(["210281665921110@lid"]);
+    await transport.markRead("pizzaria-demo", { to: inbound[0]!.replyJid, messageId: "lid-1" });
+    expect(sockets[0]?.reads[0]?.remoteJid).toBe("210281665921110@lid");
+  });
+
+  it("surfaces the sendMessage error instead of reporting success", async () => {
+    const sockets: FakeSocket[] = [];
+    const transport = new BaileysWhatsAppTransport({
+      sessionDir: tempDir(),
+      factory: { create: async () => { const socket = new FakeSocket(); sockets.push(socket); return socket; } },
+      clock: clockAt("2026-06-15T15:00:00.000Z"),
+      reconnectBaseMs: 2_000,
+      reconnectMaxMs: 60_000,
+      onInbound: () => undefined,
+      onStatus: () => undefined
+    });
+    await transport.connect("pizzaria-demo");
+    sockets[0]?.emit("connection.update", { connection: "open" });
+    await transport.whenIdle();
+    sockets[0]!.failSend = "Connection Closed";
+    const sent = await transport.sendText("pizzaria-demo", { to: "5511999990000", text: "Olá" });
+    expect(sent).toEqual({ ok: false, reason: "network", detail: "Connection Closed" });
+  });
+
+  it("promotes a server ack to delivered and read without going backwards", async () => {
+    const sockets: FakeSocket[] = [];
+    const acks: string[] = [];
+    const transport = new BaileysWhatsAppTransport({
+      sessionDir: tempDir(),
+      factory: { create: async () => { const socket = new FakeSocket(); sockets.push(socket); return socket; } },
+      clock: clockAt("2026-06-15T15:00:00.000Z"),
+      reconnectBaseMs: 2_000,
+      reconnectMaxMs: 60_000,
+      onInbound: () => undefined,
+      onStatus: () => undefined,
+      onMessageAck: (event) => acks.push(event.ack)
+    });
+    await transport.connect("pizzaria-demo");
+    sockets[0]?.emit("connection.update", { connection: "open" });
+    await transport.whenIdle();
+    sockets[0]?.emit("messages.update", [
+      { key: { id: "out", fromMe: true, remoteJid: "210281665921110@lid" }, update: { status: 3 } },
+      { key: { id: "out", fromMe: true, remoteJid: "210281665921110@lid" }, update: { status: 4 } },
+      { key: { id: "other", fromMe: false, remoteJid: "210281665921110@lid" }, update: { status: 4 } }
+    ]);
+    expect(acks).toEqual(["delivered", "read"]);
+  });
+});
 
 describe("meta cloud transport", () => {
   it("sends text through the existing Cloud API adapter and keeps media as a skeleton", async () => {
@@ -513,6 +613,84 @@ describe("attendance bridge", () => {
     await service.processPending();
     await drain();
     expect(transport.sent).toHaveLength(0);
+  });
+});
+
+describe("LID contact and delivery", () => {
+  it("keeps one contact for the phone and the LID and replies to the LID", async () => {
+    const transport = new FakeTransport("unofficial_qr");
+    const { provider } = providerWith(transport);
+    provider.recordInbound("pizzaria-demo", "5511999990000", "2026-06-15T14:00:00.000Z", "oi");
+    provider.rememberChat("pizzaria-demo", {
+      contactId: "5511999990000",
+      replyJid: "210281665921110@lid",
+      aliases: ["lid:210281665921110"]
+    });
+    provider.recordInbound("pizzaria-demo", "lid:210281665921110", "2026-06-15T14:05:00.000Z", "SAIR");
+    const sent = await provider.sendText("pizzaria-demo", {
+      to: "lid:210281665921110",
+      text: "ainda aqui",
+      kind: "reply",
+      role: "BOT"
+    });
+    expect(sent.ok).toBe(false);
+    expect(transport.sent).toHaveLength(0);
+    const notice = await provider.sendText("pizzaria-demo", {
+      to: "5511999990000",
+      text: "confirmação",
+      kind: "reply",
+      role: "SYSTEM",
+      optOutNotice: true
+    });
+    expect(notice.ok).toBe(true);
+    expect(transport.sent[0]?.to).toBe("210281665921110@lid");
+  });
+
+  it("keeps the bot reply queued until send fails, then shows the error", async () => {
+    const transport = new FakeTransport("unofficial_qr");
+    transport.sendText = async (tenantId, input) => {
+      transport.sent.push({ tenantId, ...input });
+      return { ok: false, reason: "network", detail: "Connection Closed" };
+    };
+    const store = new MemoryInboundEventStore();
+    const bridge: { service?: LocalAttendanceService } = {};
+    const channel = createWhatsAppChannel({
+      config: { ...disabledWhatsAppConfig(), enabled: true, provider: "unofficial_qr", sessionDir: tempDir(), stateDir: tempDir() },
+      graphApiVersion: "v24.0",
+      resolveChannelId: () => "demo-pizzaria-phone",
+      enqueue: (message) => store.enqueue(message),
+      onDelivery: (update) => bridge.service?.markDelivery(update.tenantId, update.messageId, update),
+      clock: clockAt("2026-06-15T18:00:00.000Z"),
+      transports: { unofficial_qr: transport, meta_cloud: new FakeTransport("meta_cloud", "disconnected") },
+      log: () => undefined
+    });
+    const service = new LocalAttendanceService(store, {
+      onCustomerMessage: (event) => channel.handleCustomerMessage(event),
+      onOutboundMessage: (event) => channel.handleOutbound(event)
+    });
+    bridge.service = service;
+    await channel.acceptInbound({
+      tenantId: "pizzaria-demo",
+      provider: "unofficial_qr",
+      providerMessageId: "lid-in",
+      from: "5511999990000",
+      replyJid: "210281665921110@lid",
+      phone: "5511999990000",
+      aliases: ["lid:210281665921110"],
+      timestamp: new Date("2026-06-15T17:59:00.000Z"),
+      type: "text",
+      text: "oi"
+    });
+    await service.processPending();
+    const conversation = service.listConversations("pizzaria-demo")[0]!;
+    const before = service.getConversation("pizzaria-demo", conversation.id).messages.find((message) => message.role === "BOT");
+    expect(before?.deliveryStatus === "PENDING" || before?.deliveryStatus === "BLOCKED").toBe(true);
+    await drain();
+    const after = service.getConversation("pizzaria-demo", conversation.id).messages.find((message) => message.role === "BOT");
+    expect(after?.deliveryStatus).toBe("BLOCKED");
+    expect(after?.deliveryDetail).toContain("Connection Closed");
+    expect(transport.sent.map((item) => item.to)).toContain("210281665921110@lid");
+    expect(transport.sent.map((item) => item.to)).not.toContain("210281665921110@s.whatsapp.net");
   });
 });
 

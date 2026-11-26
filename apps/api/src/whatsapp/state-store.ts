@@ -51,10 +51,14 @@ export interface ChannelDocument {
   buckets: Record<string, BucketRecord>;
   identical: IdenticalSend[];
   phones: Record<string, string>;
+  /** `contactKey(tenant, alias)` → id canônico do mesmo contato. */
+  identities: Record<string, string>;
+  /** `contactKey(tenant, contactId)` → JID usado para responder. */
+  replyJids: Record<string, string>;
 }
 
 export function emptyChannelDocument(): ChannelDocument {
-  return { version: 1, tenants: {}, contacts: {}, buckets: {}, identical: [], phones: {} };
+  return { version: 1, tenants: {}, contacts: {}, buckets: {}, identical: [], phones: {}, identities: {}, replyJids: {} };
 }
 
 export function contactKey(tenantId: string, phone: string): string {
@@ -123,6 +127,8 @@ export class ChannelStateStore {
       if (isRecord(parsed.buckets)) document.buckets = parsed.buckets as ChannelDocument["buckets"];
       if (Array.isArray(parsed.identical)) document.identical = parsed.identical as IdenticalSend[];
       if (isRecord(parsed.phones)) document.phones = parsed.phones as ChannelDocument["phones"];
+      if (isRecord(parsed.identities)) document.identities = parsed.identities as ChannelDocument["identities"];
+      if (isRecord(parsed.replyJids)) document.replyJids = parsed.replyJids as ChannelDocument["replyJids"];
       return document;
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return emptyChannelDocument();

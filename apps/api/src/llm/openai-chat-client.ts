@@ -5,8 +5,10 @@ import {
 } from "./settings.js";
 
 export interface LlmChatMessage {
-  role: "system" | "user" | "assistant";
+  role: "system" | "user" | "assistant" | "tool";
   content: string;
+  toolCallId?: string;
+  toolCalls?: LlmToolCall[];
 }
 
 export interface LlmTool {
@@ -150,10 +152,28 @@ function headersFor(settings: LlmSettings): Record<string, string> {
   return headers;
 }
 
+function wireMessage(message: LlmChatMessage): Record<string, unknown> {
+  if (message.role === "tool") {
+    return { role: "tool", tool_call_id: message.toolCallId ?? "", content: message.content };
+  }
+  if (message.role === "assistant" && message.toolCalls && message.toolCalls.length > 0) {
+    return {
+      role: "assistant",
+      content: message.content || null,
+      tool_calls: message.toolCalls.map((call) => ({
+        id: call.id,
+        type: "function",
+        function: { name: call.name, arguments: JSON.stringify(call.arguments ?? {}) }
+      }))
+    };
+  }
+  return { role: message.role, content: message.content };
+}
+
 function bodyFor(settings: LlmSettings, messages: readonly LlmChatMessage[], tools: readonly LlmTool[] | undefined): string {
   return JSON.stringify({
     model: settings.model,
-    messages,
+    messages: messages.map(wireMessage),
     temperature: 0,
     stream: false,
     ...(tools && tools.length > 0

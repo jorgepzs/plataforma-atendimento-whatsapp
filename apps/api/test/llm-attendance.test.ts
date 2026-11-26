@@ -113,7 +113,7 @@ describe("LLM gateway in the attendance worker", () => {
     expect(requests).toHaveLength(0);
     expect(greeting.conversation.state).toBe("BOT_ACTIVE");
 
-    const order = await ask(service, "quero fazer um pedido", "5511991000003");
+    const order = await ask(service, "quero reservar uma mesa para hoje", "5511991000003");
     expect(requests).toHaveLength(0);
     expect(order.conversation.state).toBe("WAITING_HUMAN");
     expect(order.messages).toHaveLength(1);

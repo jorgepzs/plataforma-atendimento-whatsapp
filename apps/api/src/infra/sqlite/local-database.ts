@@ -294,6 +294,30 @@ const migrations = [
       CREATE INDEX attendance_outbox_dispatch_idx
         ON attendance_outbox (status, created_at, ordinal);
     `
+  },
+  {
+    version: 6,
+    name: "customer_orders",
+    sql: `
+      CREATE TABLE attendance_orders (
+        id TEXT PRIMARY KEY,
+        ordinal INTEGER NOT NULL UNIQUE,
+        tenant_id TEXT NOT NULL REFERENCES attendance_tenants(id) ON DELETE CASCADE,
+        conversation_id TEXT NOT NULL REFERENCES attendance_conversations(id) ON DELETE CASCADE,
+        status TEXT NOT NULL CHECK (status IN (
+          'draft', 'awaiting_confirmation', 'confirmed', 'sent_to_integration', 'cancelled'
+        )),
+        order_json TEXT NOT NULL CHECK (json_valid(order_json))
+      );
+      CREATE INDEX attendance_orders_tenant_idx ON attendance_orders (tenant_id, ordinal);
+    `
+  },
+  {
+    version: 7,
+    name: "message_delivery_detail",
+    sql: `
+      ALTER TABLE attendance_messages ADD COLUMN delivery_detail TEXT;
+    `
   }
 ] as const;
 
@@ -426,12 +450,16 @@ class SqliteAttendanceRepository implements AttendanceStateRepository {
       FROM attendance_conversations ORDER BY ordinal
     `).all() as Array<Record<string, string | number | null>>;
     const messages = this.database.connection.prepare(`
-      SELECT id, conversation_id, role, text, created_at, delivery_status, author_name
+      SELECT id, conversation_id, role, text, created_at, delivery_status, delivery_detail, author_name
       FROM attendance_messages ORDER BY ordinal
     `).all() as Array<Record<string, string | number | null>>;
     const processedInboundIds = this.database.connection.prepare(`
       SELECT event_key FROM attendance_processed_inbound ORDER BY ordinal
     `).all() as Array<{ event_key: string }>;
+    const orderRows = this.database.connection.prepare(`
+      SELECT order_json FROM attendance_orders ORDER BY ordinal
+    `).all() as Array<{ order_json: string }>;
+    const orders = orderRows.map((row) => JSON.parse(row.order_json) as AttendanceSnapshot["orders"] extends Array<infer T> | undefined ? T : never);
     const outbox = this.database.connection.prepare(`
       SELECT id, tenant_id, conversation_id, message_id, source_inbound_message_id, source,
         phone_number_id, last_inbound_at, status, blocked_reason, attempt_count,
@@ -466,6 +494,7 @@ class SqliteAttendanceRepository implements AttendanceStateRepository {
         role: String(row.role) as AttendanceSnapshot["messages"][number]["role"],
         text: String(row.text), createdAt: String(row.created_at),
         deliveryStatus: String(row.delivery_status) as AttendanceSnapshot["messages"][number]["deliveryStatus"],
+        ...(row.delivery_detail ? { deliveryDetail: String(row.delivery_detail) } : {}),
         authorName: row.author_name === null ? null : String(row.author_name)
       })),
       outbox: outbox.map((row) => ({
@@ -483,6 +512,7 @@ class SqliteAttendanceRepository implements AttendanceStateRepository {
         createdAt: String(row.created_at), attemptedAt: row.attempted_at === null ? null : String(row.attempted_at),
         completedAt: row.completed_at === null ? null : String(row.completed_at)
       })),
+      ...(orders.length > 0 ? { orders } : {}),
       processedInboundIds: processedInboundIds.map((row) => row.event_key)
     };
   }
@@ -490,6 +520,7 @@ class SqliteAttendanceRepository implements AttendanceStateRepository {
   save(snapshot: AttendanceSnapshot): void {
     this.database.transaction(() => {
       this.database.connection.exec(`
+        DELETE FROM attendance_orders;
         DELETE FROM attendance_outbox;
         DELETE FROM attendance_processed_inbound;
         DELETE FROM attendance_conversations;
@@ -525,12 +556,12 @@ class SqliteAttendanceRepository implements AttendanceStateRepository {
 
       const insertMessage = this.database.connection.prepare(`
         INSERT INTO attendance_messages
-          (id, ordinal, conversation_id, role, text, created_at, delivery_status, author_name)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+          (id, ordinal, conversation_id, role, text, created_at, delivery_status, delivery_detail, author_name)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       snapshot.messages.forEach((message, ordinal) => insertMessage.run(
         message.id, ordinal, message.conversationId, message.role, message.text, message.createdAt,
-        message.deliveryStatus, message.authorName
+        message.deliveryStatus, message.deliveryDetail ?? null, message.authorName
       ));
 
       const insertOutbox = this.database.connection.prepare(`
@@ -551,6 +582,14 @@ class SqliteAttendanceRepository implements AttendanceStateRepository {
         INSERT INTO attendance_processed_inbound (event_key, ordinal) VALUES (?, ?)
       `);
       snapshot.processedInboundIds.forEach((eventKey, ordinal) => insertProcessed.run(eventKey, ordinal));
+
+      const insertOrder = this.database.connection.prepare(`
+        INSERT INTO attendance_orders (id, ordinal, tenant_id, conversation_id, status, order_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      (snapshot.orders ?? []).forEach((order, ordinal) => insertOrder.run(
+        order.id, ordinal, order.tenantId, order.conversationId, order.status, JSON.stringify(order)
+      ));
     });
   }
 }

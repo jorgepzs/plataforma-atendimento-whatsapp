@@ -22,7 +22,7 @@ import {
   type ContactRecord,
   type TenantChannelRecord
 } from "./state-store.js";
-import { splitOutboundText, digitsPhone, isOptOutMessage, textFingerprint } from "./text.js";
+import { contactIdFrom, destinationJid, isOptOutMessage, splitOutboundText, textFingerprint } from "./text.js";
 import type {
   WhatsAppInboundMessage,
   WhatsAppOutboundMedia,
@@ -156,9 +156,10 @@ export class PolicyWhatsAppProvider implements WhatsAppProvider {
   }
 
   async sendText(tenantId: string, message: WhatsAppOutboundText): Promise<WhatsAppSendOutcome> {
-    const phone = digitsPhone(message.to);
-    if (!phone) return { ok: false, reason: "invalid_recipient" };
-    const decision = this.authorize(tenantId, { ...message, to: phone });
+    const contactId = this.canonicalContact(tenantId, message.to);
+    const destination = this.outboundDestination(tenantId, contactId, message.replyJid);
+    if (!contactId || !destination) return { ok: false, reason: "invalid_recipient" };
+    const decision = this.authorize(tenantId, { ...message, to: contactId });
     if (!decision.allow) return { ok: false, reason: decision.reason };
     return this.queue.enqueue(tenantId, async () => {
       const transport = this.transport(tenantId);
@@ -168,17 +169,17 @@ export class PolicyWhatsAppProvider implements WhatsAppProvider {
       await this.clock.sleep(decision.delayMs);
       if (this.readTenant(tenantId).halted) return { ok: false, reason: "halted" };
       if (decision.markRead && message.inboundMessageId) {
-        await transport.markRead(tenantId, { to: phone, messageId: message.inboundMessageId }).catch(() => undefined);
+        await transport.markRead(tenantId, { to: destination, messageId: message.inboundMessageId }).catch(() => undefined);
       }
       let providerMessageId = "sent";
       for (const chunk of decision.chunks) {
         if (decision.sendTyping) {
-          await transport.sendPresence(tenantId, phone, "composing").catch(() => undefined);
+          await transport.sendPresence(tenantId, destination, "composing").catch(() => undefined);
           await this.clock.sleep(typingDuration(chunk, this.settingsFor(tenantId)));
-          await transport.sendPresence(tenantId, phone, "paused").catch(() => undefined);
+          await transport.sendPresence(tenantId, destination, "paused").catch(() => undefined);
         }
-        const result = await transport.sendText(tenantId, { to: phone, text: chunk });
-        if (!result.ok) return { ok: false, reason: result.reason };
+        const result = await transport.sendText(tenantId, { to: destination, text: chunk });
+        if (!result.ok) return { ok: false, reason: result.reason, ...(result.detail ? { detail: result.detail } : {}) };
         providerMessageId = result.providerMessageId;
       }
       return { ok: true, providerMessageId, chunks: decision.chunks.length };
@@ -186,14 +187,15 @@ export class PolicyWhatsAppProvider implements WhatsAppProvider {
   }
 
   async sendMedia(tenantId: string, message: WhatsAppOutboundMedia): Promise<WhatsAppSendOutcome> {
-    const phone = digitsPhone(message.to);
-    if (!phone) return { ok: false, reason: "invalid_recipient" };
+    const contactId = this.canonicalContact(tenantId, message.to);
+    const destination = this.outboundDestination(tenantId, contactId, undefined);
+    if (!contactId || !destination) return { ok: false, reason: "invalid_recipient" };
     const caption = message.caption?.trim() ?? "";
     if (caption && splitOutboundText(caption, this.settingsFor(tenantId).maxMessageChars).length > 1) {
       return { ok: false, reason: "message_too_long" };
     }
     const decision = this.authorize(tenantId, {
-      to: phone,
+      to: contactId,
       text: caption,
       kind: message.kindOfSend,
       role: message.role,
@@ -208,33 +210,62 @@ export class PolicyWhatsAppProvider implements WhatsAppProvider {
       }
       await this.clock.sleep(decision.delayMs);
       if (decision.sendTyping) {
-        await transport.sendPresence(tenantId, phone, "composing").catch(() => undefined);
+        await transport.sendPresence(tenantId, destination, "composing").catch(() => undefined);
         await this.clock.sleep(typingDuration(caption || "midia", this.settingsFor(tenantId)));
-        await transport.sendPresence(tenantId, phone, "paused").catch(() => undefined);
+        await transport.sendPresence(tenantId, destination, "paused").catch(() => undefined);
       }
       const result = await transport.sendMedia(tenantId, {
-        to: phone,
+        to: destination,
         kind: message.kind,
         data: message.data,
         mimeType: message.mimeType,
         ...(message.fileName ? { fileName: message.fileName } : {}),
         ...(caption ? { caption } : {})
       });
-      if (!result.ok) return { ok: false, reason: result.reason };
+      if (!result.ok) return { ok: false, reason: result.reason, ...(result.detail ? { detail: result.detail } : {}) };
       return { ok: true, providerMessageId: result.providerMessageId, chunks: 1 };
     });
   }
 
   async sendPresence(tenantId: string, to: string, presence: "composing" | "paused"): Promise<void> {
-    const phone = digitsPhone(to);
-    if (!phone) return;
-    await this.transport(tenantId).sendPresence(tenantId, phone, presence);
+    const destination = this.outboundDestination(tenantId, this.canonicalContact(tenantId, to), undefined);
+    if (!destination) return;
+    await this.transport(tenantId).sendPresence(tenantId, destination, presence);
   }
 
   async markRead(tenantId: string, input: { to: string; messageId: string }): Promise<void> {
-    const phone = digitsPhone(input.to);
-    if (!phone) return;
-    await this.transport(tenantId).markRead(tenantId, { to: phone, messageId: input.messageId });
+    const destination = this.outboundDestination(tenantId, this.canonicalContact(tenantId, input.to), undefined);
+    if (!destination) return;
+    await this.transport(tenantId).markRead(tenantId, { to: destination, messageId: input.messageId });
+  }
+
+  rememberChat(tenantId: string, input: { contactId: string; replyJid: string; aliases?: string[] }): void {
+    const replyJid = destinationJid(input.replyJid);
+    const contactId = contactIdFrom(input.contactId);
+    if (!replyJid || !contactId) return;
+    this.options.store.update((draft) => {
+      for (const alias of input.aliases ?? []) {
+        if (!alias || alias === contactId) continue;
+        const fromKey = contactKey(tenantId, alias);
+        const toKey = contactKey(tenantId, contactId);
+        const previous = draft.contacts[fromKey];
+        if (previous && !draft.contacts[toKey]) draft.contacts[toKey] = previous;
+        delete draft.contacts[fromKey];
+        const fromBucket = `contact:${tenantId}:${alias}`;
+        const toBucket = `contact:${tenantId}:${contactId}`;
+        const bucket = draft.buckets[fromBucket];
+        if (bucket && !draft.buckets[toBucket]) draft.buckets[toBucket] = bucket;
+        delete draft.buckets[fromBucket];
+        draft.identities[fromKey] = contactId;
+      }
+      draft.replyJids[contactKey(tenantId, contactId)] = replyJid;
+    });
+  }
+
+  replyJidFor(tenantId: string, contactId: string): string | undefined {
+    const canonical = this.canonicalContact(tenantId, contactId);
+    if (!canonical) return undefined;
+    return this.options.store.snapshot().replyJids[contactKey(tenantId, canonical)];
   }
 
   onInbound(handler: (message: WhatsAppInboundMessage) => void): void {
@@ -306,12 +337,13 @@ export class PolicyWhatsAppProvider implements WhatsAppProvider {
   }
 
   recordInbound(tenantId: string, phone: string, at: string, text: string): { optedOut: boolean; freshOptOut: boolean } {
-    const normalizedPhone = digitsPhone(phone);
+    const normalizedPhone = contactIdFrom(phone);
     if (!normalizedPhone) return { optedOut: false, freshOptOut: false };
     let result = { optedOut: false, freshOptOut: false };
     this.options.store.update((draft) => {
       const settings = this.settingsForDraft(draft, tenantId);
-      const key = contactKey(tenantId, normalizedPhone);
+      const canonical = draft.identities[contactKey(tenantId, normalizedPhone)] ?? normalizedPhone;
+      const key = contactKey(tenantId, canonical);
       const existing = draft.contacts[key];
       const contact: ContactRecord = existing ?? {
         firstInboundAt: at,
@@ -339,7 +371,7 @@ export class PolicyWhatsAppProvider implements WhatsAppProvider {
   }
 
   setOptIn(tenantId: string, phone: string, optedIn: boolean): boolean {
-    const normalized = digitsPhone(phone);
+    const normalized = this.canonicalContact(tenantId, phone);
     if (!normalized) return false;
     let changed = false;
     this.options.store.update((draft) => {
@@ -353,7 +385,7 @@ export class PolicyWhatsAppProvider implements WhatsAppProvider {
   }
 
   clearOptOut(tenantId: string, phone: string): boolean {
-    const normalized = digitsPhone(phone);
+    const normalized = this.canonicalContact(tenantId, phone);
     if (!normalized) return false;
     let changed = false;
     this.options.store.update((draft) => {
@@ -372,6 +404,19 @@ export class PolicyWhatsAppProvider implements WhatsAppProvider {
 
   private settingsForDraft(draft: ChannelDocument, tenantId: string): AntiBanSettings {
     return mergeAntiBan(this.options.settings, draft.tenants[tenantId]?.policy);
+  }
+
+  private canonicalContact(tenantId: string, value: string): string | undefined {
+    const id = contactIdFrom(value);
+    if (!id) return undefined;
+    return this.options.store.snapshot().identities[contactKey(tenantId, id)] ?? id;
+  }
+
+  private outboundDestination(tenantId: string, contactId: string | undefined, replyJid: string | undefined): string | undefined {
+    if (!contactId) return undefined;
+    const provider = this.readTenant(tenantId).provider ?? this.id;
+    if (provider !== "unofficial_qr") return contactId.startsWith("lid:") ? undefined : contactId;
+    return destinationJid(replyJid ?? "") ?? this.replyJidFor(tenantId, contactId) ?? destinationJid(contactId);
   }
 
   private readTenant(tenantId: string): TenantChannelRecord {
