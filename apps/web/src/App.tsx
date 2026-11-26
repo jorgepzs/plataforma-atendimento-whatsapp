@@ -1,6 +1,7 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { LogOut, MessageCircle, ShieldCheck, Sparkles, UserRound } from "lucide-react";
+import { MessageCircle, UserRound } from "lucide-react";
 import { ApiError, apiRequest, formatApiError, type Session, type Tenant } from "./api";
+import { Button } from "./ui";
 import { Workspace } from "./Workspace";
 
 type SystemInfo = {
@@ -139,43 +140,41 @@ function App() {
   }
 
   return (
-    <div className="app-shell">
-      <aside className="sidebar">
-        <a className="brand" href="#inicio"><span className="brand-mark"><MessageCircle size={18} /></span><span>atende</span></a>
-        <div className="sidebar-note"><Sparkles size={16} /><span>Acesso local</span></div>
-      </aside>
-      <main className="main-content">
-        <header className="topbar">
-          <div className="breadcrumb">Entrar</div>
-          {session && <button className="icon-button" type="button" aria-label="Sair" onClick={() => void logout()}><LogOut size={15} /></button>}
-        </header>
-        <div className="content-wrap">
-          {infoError && <div className="inline-alert error">{infoError}</div>}
-          {authState === "checking" && <p className="muted-copy">Verificando sessão…</p>}
-          {authState === "disabled" && <section className="notice-card"><ShieldCheck size={18} /><div><h2>Atendimento local desligado</h2><p>Esta instalação não abriu o painel de operação.</p></div></section>}
-          {authState === "error" && <button className="secondary-button" type="button" onClick={() => window.location.reload()}>Tentar de novo</button>}
-          {authState === "anonymous" && (
-            <section className="login-layout">
-              <form className="panel login-card" onSubmit={(event) => void submitLogin(event)}>
-                <div className="panel-heading"><span className="panel-icon"><ShieldCheck size={18} /></span><div><h2>Entrar</h2></div></div>
-                {loginError && <div className="inline-alert error">{loginError}</div>}
-                <label className="field-label" htmlFor="login-email">E-mail</label>
+    <div className="auth">
+      <div className="auth-card">
+        <div className="brand"><span><MessageCircle size={16} /></span> atende</div>
+        {infoError && <div className="banner bad" role="alert">{infoError}</div>}
+        {authState === "checking" && <p className="muted">Verificando sessão…</p>}
+        {authState === "disabled" && (
+          <section className="section-card">
+            <h2>Atendimento local desligado</h2>
+            <p>Esta instalação não abriu o painel de operação.</p>
+          </section>
+        )}
+        {authState === "error" && <Button variant="secondary" onClick={() => window.location.reload()}>Tentar de novo</Button>}
+        {authState === "anonymous" && (
+          <div className="auth-grid">
+            <form className="section-card stack" onSubmit={(event) => void submitLogin(event)}>
+              <h2>Entrar</h2>
+              {loginError && <div className="banner bad" role="alert">{loginError}</div>}
+              <label className="field" htmlFor="login-email"><span>E-mail</span>
                 <input id="login-email" type="email" autoComplete="username" required value={email} onChange={(event) => setEmail(event.target.value)} disabled={busy} />
-                <label className="field-label" htmlFor="login-password">Senha</label>
+              </label>
+              <label className="field" htmlFor="login-password"><span>Senha</span>
                 <input id="login-password" type="password" autoComplete="current-password" required value={password} onChange={(event) => setPassword(event.target.value)} disabled={busy} />
-                <button className="primary-button full-button" type="submit" disabled={busy}>{busy ? "Entrando…" : "Entrar"}</button>
-              </form>
-              <aside className="panel">
-                <h2>Contas de demonstração</h2>
-                <Demo email="admin@atende.local" role="Administração" onUse={() => { setEmail("admin@atende.local"); setPassword("AtendeLocal123!"); }} />
-                <Demo email="pizzaria@atende.local" role="Pizzaria Demo" onUse={() => { setEmail("pizzaria@atende.local"); setPassword("AtendeLocal123!"); }} />
-                <Demo email="barbearia@atende.local" role="Barbearia Demo" onUse={() => { setEmail("barbearia@atende.local"); setPassword("AtendeLocal123!"); }} />
-                <p className="form-footnote">Senha: AtendeLocal123!</p>
-              </aside>
-            </section>
-          )}
-        </div>
-      </main>
+              </label>
+              <Button type="submit" disabled={busy}>{busy ? "Entrando…" : "Entrar"}</Button>
+            </form>
+            <aside className="section-card">
+              <h2>Contas de demonstração</h2>
+              <Demo email="admin@atende.local" role="Administração" onUse={() => { setEmail("admin@atende.local"); setPassword("AtendeLocal123!"); }} />
+              <Demo email="pizzaria@atende.local" role="Pizzaria Demo" onUse={() => { setEmail("pizzaria@atende.local"); setPassword("AtendeLocal123!"); }} />
+              <Demo email="barbearia@atende.local" role="Barbearia Demo" onUse={() => { setEmail("barbearia@atende.local"); setPassword("AtendeLocal123!"); }} />
+              <p className="muted">Senha: AtendeLocal123!</p>
+            </aside>
+          </div>
+        )}
+      </div>
     </div>
   );
 }
@@ -183,9 +182,9 @@ function App() {
 function Demo({ email, role, onUse }: { email: string; role: string; onUse: () => void }) {
   return (
     <div className="account-row">
-      <span className="account-avatar"><UserRound size={15} /></span>
-      <span className="account-copy"><strong>{email}</strong><small>{role}</small></span>
-      <button className="use-account" type="button" onClick={onUse}>Usar</button>
+      <span className="avatar"><UserRound size={15} /></span>
+      <span><strong>{email}</strong><small>{role}</small></span>
+      <button className="btn quiet sm" type="button" onClick={onUse}>Usar</button>
     </div>
   );
 }

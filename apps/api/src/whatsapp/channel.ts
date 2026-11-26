@@ -33,6 +33,15 @@ export interface CreateChannelOptions {
   fetch?: typeof fetch;
 }
 
+export interface WhatsAppUsageView {
+  sentToday: number;
+  dailyCap: number;
+  effectiveDailyCap: number;
+  warmupDay: number;
+  warmupDays: number;
+  inWarmup: boolean;
+}
+
 export interface WhatsAppPublicView {
   enabled: true;
   provider: WhatsAppProviderId;
@@ -46,6 +55,7 @@ export interface WhatsAppPublicView {
   metaConfigured: boolean;
   proactiveEnabled: boolean;
   antiBan: ReturnType<typeof publicAntiBan>;
+  usage: WhatsAppUsageView;
 }
 
 function stateFile(config: WhatsAppChannelConfig): string | undefined {
@@ -91,7 +101,8 @@ export class WhatsAppChannel {
       qrAvailable: status.qrAvailable,
       metaConfigured: Boolean((tenant?.metaPhoneNumberId || this.options.config.metaPhoneNumberId) && (tenant?.metaAccessToken || this.options.config.metaAccessToken)),
       proactiveEnabled: settings.proactiveEnabled,
-      antiBan: publicAntiBan(settings)
+      antiBan: publicAntiBan(settings),
+      usage: this.provider.usageSnapshot(tenantId)
     };
   }
 

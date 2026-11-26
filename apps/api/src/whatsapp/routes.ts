@@ -113,6 +113,16 @@ export async function registerWhatsAppRoutes(
     return reply.send(channel.view(tenantId));
   });
 
+  app.get<{ Params: unknown }>("/api/v1/tenants/:tenantId/whatsapp/contacts/:phone", async (request, reply) => {
+    const { tenantId, phone } = phoneParamsSchema.parse(request.params);
+    const session = sessionOf(request, sessions);
+    sessions.requireTenant(session, tenantId);
+    if (!channel) {
+      return reply.send({ available: false, phone, known: false, optedOut: false, optedIn: false });
+    }
+    return reply.send({ available: true, phone, ...channel.provider.contactConsent(tenantId, phone) });
+  });
+
   app.post<{ Params: unknown }>("/api/v1/tenants/:tenantId/whatsapp/contacts/:phone/opt-in", async (request, reply) => {
     const { tenantId, phone } = phoneParamsSchema.parse(request.params);
     const session = sessionOf(request, sessions);
