@@ -27,7 +27,7 @@ export interface CreateChannelOptions {
   enqueue: (message: NormalizedInboundMessage) => Promise<unknown>;
   onDelivery?: (update: DeliveryUpdate) => void;
   onMessageAck?: (event: { tenantId: string; providerMessageId: string; ack: "delivered" | "read" | "failed"; detail?: string }) => void;
-  log?: (level: "info" | "warn", payload: Record<string, unknown>, message: string) => void;
+  log?: (level: "debug" | "info" | "warn", payload: Record<string, unknown>, message: string) => void;
   clock?: Clock;
   transports?: Partial<Record<WhatsAppProviderId, WhatsAppTransport>>;
   fetch?: typeof fetch;
@@ -52,6 +52,7 @@ export interface WhatsAppPublicView {
   pairedAt: string | null;
   lastError: string | null;
   qrAvailable: boolean;
+  decryptFailuresLastHour: number;
   metaConfigured: boolean;
   proactiveEnabled: boolean;
   antiBan: ReturnType<typeof publicAntiBan>;
@@ -99,6 +100,7 @@ export class WhatsAppChannel {
       pairedAt: status.pairedAt,
       lastError: status.lastError,
       qrAvailable: status.qrAvailable,
+      decryptFailuresLastHour: status.decryptFailuresLastHour ?? 0,
       metaConfigured: Boolean((tenant?.metaPhoneNumberId || this.options.config.metaPhoneNumberId) && (tenant?.metaAccessToken || this.options.config.metaAccessToken)),
       proactiveEnabled: settings.proactiveEnabled,
       antiBan: publicAntiBan(settings),
@@ -229,7 +231,12 @@ export function createWhatsAppChannel(options: CreateChannelOptions): WhatsAppCh
   let channel: WhatsAppChannel | undefined;
   const unofficial = options.transports?.unofficial_qr ?? new BaileysWhatsAppTransport({
     sessionDir: options.config.sessionDir ?? ".data/whatsapp/sessions",
-    factory: createBaileysSocketFactory(),
+    factory: createBaileysSocketFactory(options.log ? {
+      log: {
+        debug: (payload, message) => options.log?.("debug", payload, message),
+        warn: (payload, message) => options.log?.("warn", payload, message)
+      }
+    } : {}),
     clock,
     reconnectBaseMs: options.config.antiBan.reconnectBaseMs,
     reconnectMaxMs: options.config.antiBan.reconnectMaxMs,

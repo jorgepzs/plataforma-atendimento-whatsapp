@@ -46,6 +46,8 @@ export interface WhatsAppStatus {
   pairedAt: string | null;
   lastError: string | null;
   qrAvailable: boolean;
+  /** Falhas de descriptografia Signal na última hora. Ausente fora do canal QR. */
+  decryptFailuresLastHour?: number;
   updatedAt: string;
 }
 

@@ -148,6 +148,7 @@ export class PolicyWhatsAppProvider implements WhatsAppProvider {
       pairedAt: stored.pairedAt ?? live.pairedAt,
       lastError: live.lastError ?? stored.lastError,
       qrAvailable: live.qrAvailable,
+      ...(typeof live.decryptFailuresLastHour === "number" ? { decryptFailuresLastHour: live.decryptFailuresLastHour } : {}),
       updatedAt: live.updatedAt || stored.updatedAt
     };
   }

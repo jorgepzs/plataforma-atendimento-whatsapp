@@ -387,12 +387,74 @@ describe("baileys transport", () => {
     expect(transport.status("pizzaria-demo")).toMatchObject({ status: "session_replaced", halted: true });
     expect(sockets).toHaveLength(1);
   });
+
+  it("opens one socket when connect overlaps a slow start", async () => {
+    let started = 0;
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const transport = new BaileysWhatsAppTransport({
+      sessionDir: tempDir(),
+      factory: {
+        create: async () => {
+          started += 1;
+          await gate;
+          return new FakeSocket();
+        }
+      },
+      clock: clockAt("2026-06-15T15:00:00.000Z"),
+      reconnectBaseMs: 2_000,
+      reconnectMaxMs: 60_000,
+      onInbound: () => undefined,
+      onStatus: () => undefined
+    });
+    const first = transport.connect("pizzaria-demo");
+    for (let attempt = 0; attempt < 10 && started === 0; attempt += 1) await Promise.resolve();
+    const second = transport.connect("pizzaria-demo");
+    release();
+    await first;
+    await second;
+    expect(started).toBe(1);
+    expect(transport.status("pizzaria-demo").decryptFailuresLastHour).toBe(0);
+  });
+
+  it("ends the current socket before opening the next one", async () => {
+    const events: string[] = [];
+    const sockets: FakeSocket[] = [];
+    const transport = new BaileysWhatsAppTransport({
+      sessionDir: tempDir(),
+      factory: {
+        create: async () => {
+          events.push("create");
+          const socket = new FakeSocket();
+          socket.decryptFailuresLastHour = () => 4;
+          socket.onEnd = () => events.push("end");
+          sockets.push(socket);
+          return socket;
+        }
+      },
+      clock: clockAt("2026-06-15T15:00:00.000Z"),
+      reconnectBaseMs: 2_000,
+      reconnectMaxMs: 60_000,
+      onInbound: () => undefined,
+      onStatus: () => undefined
+    });
+    await transport.connect("pizzaria-demo");
+    expect(transport.status("pizzaria-demo").decryptFailuresLastHour).toBe(4);
+    sockets[0]?.emit("connection.update", { connection: "close", lastDisconnect: { error: { output: { statusCode: 428 } } } });
+    await transport.whenIdle();
+    expect(events).toEqual(["create", "end", "create"]);
+    expect(sockets).toHaveLength(2);
+  });
 });
 
 class FakeSocket implements BaileysLikeSocket {
-  user?: { id?: string };
+  user: { id?: string } | undefined = undefined;
   private readonly listeners = new Map<string, Array<(payload: any) => void>>();
   readonly sent: unknown[] = [];
+  decryptFailuresLastHour?: () => number;
+  onEnd?: () => void;
 
   ev = { on: (event: string, listener: (payload: any) => void) => {
     const list = this.listeners.get(event) ?? [];
@@ -417,7 +479,9 @@ class FakeSocket implements BaileysLikeSocket {
     this.reads.push(...keys);
   }
   async logout(): Promise<void> {}
-  end(): void {}
+  end(): void {
+    this.onEnd?.();
+  }
 }
 
 describe("LID addressing", () => {

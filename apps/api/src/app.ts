@@ -184,6 +184,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         onMessageAck: (event) => service.noteProviderAck(event.tenantId, event.providerMessageId, event.ack, event.detail),
         log: (level, payload, message) => {
           if (level === "warn") app.log.warn(payload, message);
+          else if (level === "debug") app.log.debug(payload, message);
           else app.log.info(payload, message);
         }
       });
