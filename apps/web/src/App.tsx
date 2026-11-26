@@ -50,6 +50,11 @@ type SystemInfo = {
   localDemoEnabled?: boolean;
   localAiEnabled?: boolean;
   outboundMode?: "simulated" | "cloud-api-local-test";
+  llm?: {
+    enabled: boolean;
+    provider?: "openrouter" | "local";
+    model?: string;
+  };
 };
 
 type Readiness = {
@@ -75,7 +80,16 @@ const capabilityLabels: Record<string, string> = {
   "attendance.local.persistence": "Histórico salvo localmente",
   "attendance.queue.recovery": "Recuperação da fila",
   "whatsapp.text.send.local-test": "Envio WhatsApp restrito a teste local",
+  "assistant.llm.gateway": "Gateway de IA (OpenRouter ou local)",
 };
+
+function aiStatusLabel(info: SystemInfo | null | undefined): string {
+  if (info?.llm?.enabled) {
+    const provider = info.llm.provider === "local" ? "local" : "OpenRouter";
+    return info.llm.model ? `IA ${provider} (${info.llm.model}).` : `IA ${provider}.`;
+  }
+  return info?.localAiEnabled ? "IA local habilitada." : "Sem IA local.";
+}
 
 const stateLabels: Record<ConversationState, string> = {
   BOT_ACTIVE: "Automação ativa",
@@ -862,7 +876,7 @@ function App() {
 
           {demoEnabled && authState === "authenticated" && session && (
             <>
-              <div className="demo-banner" role="note"><Sparkles size={16} /><span><strong>Demonstração local</strong> · {persistentLocal ? "Dados salvos nesta máquina" : "Dados voláteis"} · {info.value?.outboundMode === "cloud-api-local-test" ? "Envio de teste restrito ao canal e aos destinatários autorizados." : "Respostas simuladas; nada é enviado ao WhatsApp."} · {info.value?.localAiEnabled ? "IA local habilitada." : "Sem IA local."}</span></div>
+              <div className="demo-banner" role="note"><Sparkles size={16} /><span><strong>Demonstração local</strong> · {persistentLocal ? "Dados salvos nesta máquina" : "Dados voláteis"} · {info.value?.outboundMode === "cloud-api-local-test" ? "Envio de teste restrito ao canal e aos destinatários autorizados." : "Respostas simuladas; nada é enviado ao WhatsApp."} · {aiStatusLabel(info.value)}</span></div>
               {authProblem && <div className="inline-alert warning" role="status">{authProblem}</div>}
               {(tenantLoading || tenantError) && <div className={tenantError ? "inline-alert error" : "inline-alert"} role={tenantError ? "alert" : "status"}>{tenantError || "Carregando empresas permitidas…"}</div>}
 
@@ -960,15 +974,17 @@ function App() {
                         onChange={(event) => updateConfig("assistantMode", event.target.value as TenantConfig["assistantMode"])}
                         disabled={!isTenantAdmin || writeBusy}
                       >
-                        <option value="approved_faq">Respostas cadastradas (sem IA)</option>
-                        <option value="local_ai" disabled={!info.value?.localAiEnabled && config.assistantMode !== "local_ai"}>IA local (Ollama)</option>
+                        <option value="approved_faq">{info.value?.llm?.enabled ? "FAQ cadastrada e gateway de IA" : "Respostas cadastradas (sem IA)"}</option>
+                        <option value="local_ai" disabled={!info.value?.localAiEnabled && config.assistantMode !== "local_ai"}>IA local (Ollama, só FAQ)</option>
                       </select>
                       <p className="muted-copy">
-                        {config.assistantMode === "local_ai"
-                          ? info.value?.localAiEnabled
-                            ? "O modelo local só escolhe uma resposta cadastrada; se não encontrar uma resposta segura ou o modelo falhar, a conversa vai para uma pessoa."
-                            : "A IA local não está habilitada neste servidor. Sem ela, perguntas que não coincidam exatamente com a FAQ serão encaminhadas a uma pessoa."
-                          : "Sem IA, somente perguntas iguais às cadastradas recebem resposta automática; as demais vão para uma pessoa."}
+                        {info.value?.llm?.enabled
+                          ? `O gateway (${info.value.llm.provider === "local" ? "modelo local" : "OpenRouter"}${info.value.llm.model ? `, ${info.value.llm.model}` : ""}) responde quando a pergunta não coincide com a FAQ. Se a IA falhar ou esgotar o tempo, a conversa recebe a mensagem padrão e pode ir para uma pessoa. A opção de Ollama neste campo continua restrita às respostas cadastradas.`
+                          : config.assistantMode === "local_ai"
+                            ? info.value?.localAiEnabled
+                              ? "O modelo local só escolhe uma resposta cadastrada; se não encontrar uma resposta segura ou o modelo falhar, a conversa vai para uma pessoa."
+                              : "A IA local não está habilitada neste servidor. Sem ela, perguntas que não coincidam exatamente com a FAQ serão encaminhadas a uma pessoa."
+                            : "Sem IA, somente perguntas iguais às cadastradas recebem resposta automática; as demais vão para uma pessoa."}
                       </p>
                       <label className="field-label" htmlFor="greeting">Saudação</label>
                       <textarea id="greeting" rows={3} value={config.greeting} onChange={(event) => updateConfig("greeting", event.target.value)} disabled={!isTenantAdmin || writeBusy} required maxLength={1000} />

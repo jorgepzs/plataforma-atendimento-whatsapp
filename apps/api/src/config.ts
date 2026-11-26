@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { llmSettingsFromEnvironment, type LlmSettings } from "./llm/settings.js";
 
 const booleanFromEnvironment = z.preprocess((value) => {
   if (typeof value !== "string") {
@@ -50,7 +51,37 @@ const environmentSchema = z.object({
   WHATSAPP_OUTBOUND_ALLOWED_RECIPIENTS: z.preprocess(
     (value) => (value === "" ? undefined : value),
     z.string().max(1_000).optional()
-  )
+  ),
+  LLM_PROVIDER: z.preprocess(
+    (value) => (value === "" ? undefined : value),
+    z.enum(["openrouter", "local"]).optional()
+  ),
+  LLM_BASE_URL: optionalEnvironmentString,
+  LLM_API_KEY: optionalEnvironmentString,
+  LLM_MODEL: optionalEnvironmentString,
+  LLM_TIMEOUT_MS: z.preprocess(
+    (value) => (value === "" || value === undefined ? 20_000 : value),
+    z.coerce.number().int().min(100).max(120_000)
+  ),
+  LLM_MAX_RETRIES: z.preprocess(
+    (value) => (value === "" || value === undefined ? 1 : value),
+    z.coerce.number().int().min(0).max(3)
+  ),
+  LLM_HTTP_REFERER: optionalEnvironmentString,
+  LLM_APP_TITLE: optionalEnvironmentString,
+  LLM_FAILURE_MESSAGE: optionalEnvironmentString,
+  LLM_FAILURE_ACTION: z.preprocess(
+    (value) => (value === "" || value === undefined ? "reply_and_handoff" : value),
+    z.enum(["reply", "handoff", "reply_and_handoff"])
+  ),
+  LLM_SUPPORTS_TOOLS: z.preprocess((value) => {
+    if (value === "" || value === undefined || value === null) return true;
+    if (typeof value !== "string") return value;
+    const normalized = value.toLowerCase();
+    if (["1", "true", "yes", "on"].includes(normalized)) return true;
+    if (["0", "false", "no", "off"].includes(normalized)) return false;
+    return value;
+  }, z.boolean())
 });
 
 export interface AppConfig {
@@ -71,6 +102,7 @@ export interface AppConfig {
   whatsappOutboundPhoneNumberId?: string;
   whatsappOutboundAccessToken?: string;
   whatsappOutboundAllowedRecipients: string[];
+  llm?: LlmSettings;
 }
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -111,6 +143,20 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     throw new Error("O envio de teste exige demo local em SQLite, loopback, ambiente não produtivo, ID do telefone, token privado e lista explícita de destinatários permitidos.");
   }
 
+  const llm = llmSettingsFromEnvironment({
+    timeoutMs: parsed.LLM_TIMEOUT_MS,
+    maxRetries: parsed.LLM_MAX_RETRIES,
+    failureAction: parsed.LLM_FAILURE_ACTION,
+    supportsTools: parsed.LLM_SUPPORTS_TOOLS,
+    ...(parsed.LLM_PROVIDER ? { provider: parsed.LLM_PROVIDER } : {}),
+    ...(parsed.LLM_BASE_URL ? { baseUrl: parsed.LLM_BASE_URL } : {}),
+    ...(parsed.LLM_API_KEY ? { apiKey: parsed.LLM_API_KEY } : {}),
+    ...(parsed.LLM_MODEL ? { model: parsed.LLM_MODEL } : {}),
+    ...(parsed.LLM_HTTP_REFERER ? { httpReferer: parsed.LLM_HTTP_REFERER } : {}),
+    ...(parsed.LLM_APP_TITLE ? { appTitle: parsed.LLM_APP_TITLE } : {}),
+    ...(parsed.LLM_FAILURE_MESSAGE ? { failureMessage: parsed.LLM_FAILURE_MESSAGE } : {})
+  });
+
   if (parsed.NODE_ENV === "production") {
     if (!parsed.DATABASE_URL) {
       throw new Error("DATABASE_URL é obrigatória em produção.");
@@ -142,7 +188,8 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     ...(parsed.WHATSAPP_OUTBOUND_ENABLED && parsed.WHATSAPP_OUTBOUND_PHONE_NUMBER_ID ? { whatsappOutboundPhoneNumberId: parsed.WHATSAPP_OUTBOUND_PHONE_NUMBER_ID } : {}),
     ...(parsed.WHATSAPP_OUTBOUND_ENABLED && parsed.WHATSAPP_OUTBOUND_ACCESS_TOKEN ? { whatsappOutboundAccessToken: parsed.WHATSAPP_OUTBOUND_ACCESS_TOKEN } : {}),
     ...(parsed.DATABASE_URL ? { databaseUrl: parsed.DATABASE_URL } : {}),
-    ...(parsed.META_APP_SECRET ? { metaAppSecret: parsed.META_APP_SECRET } : {})
+    ...(parsed.META_APP_SECRET ? { metaAppSecret: parsed.META_APP_SECRET } : {}),
+    ...(llm ? { llm } : {})
   };
 }
 

@@ -25,6 +25,17 @@ const children = [];
 let stopping = false;
 let shutdownPromise;
 
+function llmEnvironmentFromFile() {
+  const envPath = resolve(projectRoot, ".env");
+  if (!existsSync(envPath)) return {};
+  try {
+    const parsed = parseEnv(readFileSync(envPath, "utf8"));
+    return Object.fromEntries(Object.entries(parsed).filter(([key]) => key.startsWith("LLM_")));
+  } catch {
+    return {};
+  }
+}
+
 function assertInstalledDependencies() {
   const missing = [];
   if (!existsSync(apiTsx)) missing.push("apps/api dependencies");
@@ -188,6 +199,7 @@ async function main() {
       : resolve(process.env.LOCAL_SQLITE_PATH || resolve(projectRoot, ".data/attendance.sqlite"))
     : "";
   const apiEnv = {
+    ...llmEnvironmentFromFile(),
     ...process.env,
     ...postgresEnvironment,
     NODE_ENV: "development",

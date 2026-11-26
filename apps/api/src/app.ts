@@ -15,6 +15,7 @@ import { registerAttendanceRoutes } from "./attendance/routes.js";
 import { SqliteLocalDatabase } from "./infra/sqlite/local-database.js";
 import { SqliteInboundEventStore } from "./infra/sqlite/sqlite-inbound-event-store.js";
 import { OllamaKnowledgeAnswerSelector, type KnowledgeAnswerSelector } from "./attendance/knowledge-classifier.js";
+import { createLlmAssistant, isPrivateLlmHost, OpenAiCompatibleChatClient, type LlmChatClient } from "./llm/index.js";
 import { CloudApiTextSender } from "./infra/meta/cloud-api-text-sender.js";
 import type { OutboundTextSender } from "./ports/outbound-text-sender.js";
 
@@ -28,6 +29,7 @@ export interface BuildAppOptions {
   logger?: boolean;
   localDatabase?: SqliteLocalDatabase;
   knowledgeAnswerSelector?: KnowledgeAnswerSelector;
+  llmClient?: LlmChatClient;
   outboundSender?: OutboundTextSender;
 }
 
@@ -74,6 +76,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
                 "req.headers.x-csrf-token",
                 "res.headers.set-cookie",
                 "req.body.password",
+                "req.body.llm.apiKey",
                 "req.headers.x-hub-signature-256",
                 "req.body.entry[*].changes[*].value.contacts",
                 "req.body.entry[*].changes[*].value.messages"
@@ -90,6 +93,30 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     encoding: false,
     runFirst: true
   });
+
+  const llmSettings = options.config.llm;
+  const llmClient = llmSettings
+    ? options.llmClient ?? new OpenAiCompatibleChatClient({
+        onLog: (event) => {
+          const payload = {
+            event: event.event,
+            provider: event.provider,
+            model: event.model,
+            attempt: event.attempt,
+            ...(event.statusCode !== undefined ? { statusCode: event.statusCode } : {}),
+            ...(event.toolsDegraded !== undefined ? { toolsDegraded: event.toolsDegraded } : {})
+          };
+          if (event.level === "warn") app.log.warn(payload, "Falha no provedor de IA.");
+          else app.log.info(payload, "Provedor de IA respondeu sem ferramentas.");
+        }
+      })
+    : undefined;
+  if (llmSettings?.provider === "local") {
+    app.log.warn(
+      { model: llmSettings.model, privateHost: isPrivateLlmHost(llmSettings.baseUrl) },
+      "IA local ativa. A máquina do modelo precisa permanecer ligada; OpenRouter é a opção indicada para produção."
+    );
+  }
 
   const webhookService = new MetaWebhookService(options.store);
 
@@ -115,7 +142,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       },
       ...(options.config.localAiEnabled && options.config.localAiModel
         ? { knowledgeAnswerSelector: options.knowledgeAnswerSelector ?? new OllamaKnowledgeAnswerSelector({ model: options.config.localAiModel }) }
-        : {})
+        : {}),
+      ...(llmSettings && llmClient ? { llmAssistant: createLlmAssistant(llmClient, llmSettings) } : {})
     });
     const sessions = new LocalSessionManager(Date.now, options.localDatabase?.identityRepository);
     app.decorate("localAttendanceService", service);
@@ -147,7 +175,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     options.store,
     options.config.localDemoEnabled ?? false,
     options.config.localAiEnabled,
-    options.config.whatsappOutboundEnabled
+    options.config.whatsappOutboundEnabled,
+    llmSettings ? { provider: llmSettings.provider, model: llmSettings.model } : null
   );
   await registerMetaWebhookRoutes(app, options.config, webhookService);
 

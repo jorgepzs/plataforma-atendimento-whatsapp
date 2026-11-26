@@ -104,6 +104,68 @@ describe("environment configuration", () => {
     }
   });
 
+  it("keeps the LLM gateway disabled until a provider is selected", () => {
+    expect(loadConfig({ NODE_ENV: "development", LLM_MODEL: "openai/gpt-4o-mini" }).llm).toBeUndefined();
+    expect(loadConfig({ NODE_ENV: "development", LLM_PROVIDER: "" }).llm).toBeUndefined();
+
+    const openrouter = loadConfig({
+      NODE_ENV: "development",
+      LLM_PROVIDER: "openrouter",
+      LLM_API_KEY: "sk-or-test",
+      LLM_MODEL: "openai/gpt-4o-mini",
+      LLM_HTTP_REFERER: "https://example.com",
+      LLM_APP_TITLE: "Atendimento"
+    });
+    expect(openrouter.llm).toMatchObject({
+      provider: "openrouter",
+      baseUrl: "https://openrouter.ai/api/v1",
+      model: "openai/gpt-4o-mini",
+      apiKey: "sk-or-test",
+      httpReferer: "https://example.com",
+      appTitle: "Atendimento",
+      timeoutMs: 20_000,
+      maxRetries: 1,
+      supportsTools: true,
+      failureAction: "reply_and_handoff"
+    });
+
+    const local = loadConfig({
+      NODE_ENV: "development",
+      LLM_PROVIDER: "local",
+      LLM_MODEL: "qwen2.5:1.5b",
+      LLM_BASE_URL: "http://host.docker.internal:11434/v1/",
+      LLM_SUPPORTS_TOOLS: "false",
+      LLM_TIMEOUT_MS: "1500",
+      LLM_MAX_RETRIES: "0",
+      LLM_FAILURE_ACTION: "handoff"
+    });
+    expect(local.llm).toMatchObject({
+      provider: "local",
+      baseUrl: "http://host.docker.internal:11434/v1",
+      model: "qwen2.5:1.5b",
+      supportsTools: false,
+      timeoutMs: 1_500,
+      maxRetries: 0,
+      failureAction: "handoff"
+    });
+    expect(local.llm?.apiKey).toBeUndefined();
+
+    expect(() => loadConfig({ NODE_ENV: "development", LLM_PROVIDER: "openrouter", LLM_MODEL: "openai/gpt-4o-mini" }))
+      .toThrow("LLM_API_KEY é obrigatória quando LLM_PROVIDER=openrouter.");
+    expect(() => loadConfig({ NODE_ENV: "development", LLM_PROVIDER: "local" }))
+      .toThrow("LLM_MODEL é obrigatório quando LLM_PROVIDER está configurado.");
+    expect(() => loadConfig({ NODE_ENV: "development", LLM_PROVIDER: "outro", LLM_MODEL: "x" })).toThrow();
+
+    const secret = "sk-do-not-print-this";
+    try {
+      loadConfig({ NODE_ENV: "development", LLM_PROVIDER: "openrouter", LLM_MODEL: "openai/gpt-4o-mini", LLM_API_KEY: `${secret}\nextra` });
+      throw new Error("Esperava rejeição da chave inválida.");
+    } catch (error) {
+      expect((error as Error).message).toBe("Chave de IA inválida.");
+      expect((error as Error).message).not.toContain(secret);
+    }
+  });
+
   it("accepts explicit SQLite locally and rejects incompatible combinations", () => {
     const environment = { NODE_ENV: "development", API_HOST: "127.0.0.1", ENABLE_LOCAL_DEMO: "true", LOCAL_SQLITE_PATH: "./attendance.sqlite" };
     expect(loadConfig(environment).localSqlitePath).toBe("./attendance.sqlite");

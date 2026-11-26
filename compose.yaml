@@ -26,6 +26,19 @@ services:
       META_APP_SECRET: ${META_APP_SECRET:?Configure META_APP_SECRET no arquivo .env}
       META_REQUIRE_SIGNATURE: ${META_REQUIRE_SIGNATURE:-true}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      LLM_PROVIDER: ${LLM_PROVIDER:-}
+      LLM_BASE_URL: ${LLM_BASE_URL:-}
+      LLM_API_KEY: ${LLM_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-}
+      LLM_TIMEOUT_MS: ${LLM_TIMEOUT_MS:-}
+      LLM_MAX_RETRIES: ${LLM_MAX_RETRIES:-}
+      LLM_HTTP_REFERER: ${LLM_HTTP_REFERER:-}
+      LLM_APP_TITLE: ${LLM_APP_TITLE:-}
+      LLM_FAILURE_MESSAGE: ${LLM_FAILURE_MESSAGE:-}
+      LLM_FAILURE_ACTION: ${LLM_FAILURE_ACTION:-}
+      LLM_SUPPORTS_TOOLS: ${LLM_SUPPORTS_TOOLS:-}
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     depends_on:
       postgres:
         condition: service_healthy

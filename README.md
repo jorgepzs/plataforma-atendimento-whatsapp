@@ -25,6 +25,7 @@
 - Persistência local em SQLite para empresas, sessões, conversas, mensagens e filas de entrada e saída.
 - Respostas baseadas em FAQ aprovada e encaminhamento para uma pessoa quando não há resposta segura.
 - Classificador opcional com Ollama local: escolhe uma resposta já cadastrada, sem redigir conteúdo novo.
+- Gateway de IA compatível com OpenAI, usado tanto pela OpenRouter quanto por Ollama ou LM Studio.
 - Adaptador de envio Cloud API isolado para teste local, **desligado por padrão** e limitado a uma tentativa externa persistida.
 
 ## 🚀 Comece em poucos minutos
@@ -71,9 +72,60 @@ flowchart LR
     Painel[Painel web] <-->|Rotas autenticadas| API
     Worker -.->|Invalidação sem conteúdo| Painel
     Worker -.->|Opcional, local| Ollama[Ollama]
+    Worker -.->|Opcional| Gateway[Gateway OpenAI]
+    Gateway -.-> OpenRouter[OpenRouter]
+    Gateway -.-> LocalLLM[Ollama ou LM Studio /v1]
 ```
 
-O tenant é obtido pelo `phone_number_id` associado ao canal; o webhook não escolhe o tenant por meio de um `tenant_id` enviado pelo cliente. Mensagens desconhecidas, pedidos que exigem ação operacional e solicitações por atendente são encaminhados para a fila humana.
+O tenant é obtido pelo `phone_number_id` associado ao canal; o webhook não escolhe o tenant por meio de um `tenant_id` enviado pelo cliente. Mensagens sem texto, pedidos que exigem ação operacional e solicitações por atendente seguem para a fila humana. Perguntas que não coincidem com a FAQ vão para o gateway de IA quando ele está ligado e, sem gateway ou sem resposta segura, também seguem para uma pessoa.
+
+## Gateway de IA
+
+O gateway fica desligado até `LLM_PROVIDER` ser definido. OpenRouter e um modelo local usam o mesmo cliente de chat completions; muda só o ambiente. Sem essa variável, FAQ, webhook e fila continuam como antes.
+
+A IA local precisa da máquina do modelo ligada o tempo todo. Ela serve para desenvolvimento e testes. Para atendimento real, use OpenRouter.
+
+### OpenRouter
+
+```dotenv
+LLM_PROVIDER=openrouter
+LLM_BASE_URL=https://openrouter.ai/api/v1
+LLM_API_KEY=sua-chave
+LLM_MODEL=openai/gpt-4o-mini
+LLM_HTTP_REFERER=https://seu-dominio.example
+LLM_APP_TITLE=Plataforma de atendimento
+```
+
+Com `LLM_PROVIDER=openrouter`, o cliente envia os cabeçalhos `HTTP-Referer` e `X-Title`.
+
+### Ollama ou LM Studio
+
+Ollama em `http://127.0.0.1:11434/v1` e LM Studio em `http://127.0.0.1:1234/v1` falam o formato OpenAI. Exemplo com Ollama:
+
+```dotenv
+LLM_PROVIDER=local
+LLM_BASE_URL=http://127.0.0.1:11434/v1
+LLM_MODEL=qwen2.5:1.5b
+LLM_API_KEY=
+```
+
+Para o LM Studio, aponte `LLM_BASE_URL` para `http://127.0.0.1:1234/v1`. Se o servidor exigir autorização, use qualquer valor em `LLM_API_KEY`.
+
+Quando a API roda no Docker e o modelo está no Windows, use o host da máquina, não `127.0.0.1` de dentro do contêiner:
+
+```dotenv
+LLM_PROVIDER=local
+LLM_BASE_URL=http://host.docker.internal:11434/v1
+LLM_MODEL=qwen2.5:1.5b
+```
+
+O Compose da API já mapeia `host.docker.internal`. Ollama e LM Studio devem escutar em todas as interfaces, ou pelo menos aceitar conexão vinda do Docker. Não publique a porta do modelo na internet.
+
+`npm run dev:local` lê as variáveis `LLM_*` do `.env` da raiz. `npm run dev:api` carrega o mesmo arquivo. O classificador antigo (`LOCAL_AI_ENABLED`) continua separado e só escolhe uma FAQ pelo endpoint nativo do Ollama.
+
+Se o modelo não aceitar function calling, o gateway repete o pedido sem ferramentas e usa a resposta simples. Timeout ou erro não param a fila: a conversa recebe `LLM_FAILURE_MESSAGE` e, por padrão, segue para uma pessoa (`LLM_FAILURE_ACTION=reply_and_handoff`).
+
+Uma empresa pode sobrescrever provedor, URL, modelo e chave no `PUT /api/v1/tenants/:tenantId/config`, no objeto `llm`. A chave é gravada só para essa empresa e não volta na resposta da API. Ao trocar o provedor, envie de novo URL, modelo e chave.
 
 ## 🧱 Tecnologias
 
@@ -83,7 +135,7 @@ O tenant é obtido pelo `phone_number_id` associado ao canal; o webhook não esc
 | Painel | React, TypeScript e Vite |
 | Persistência local | SQLite integrado ao Node (`node:sqlite`) |
 | Persistência de eventos PostgreSQL | PostgreSQL e `pg` |
-| IA local opcional | Ollama, com classificação restrita à FAQ aprovada |
+| IA | Gateway compatível com OpenAI (OpenRouter ou Ollama/LM Studio) e classificador opcional de FAQ |
 | Infraestrutura preparada | Docker Compose e Caddy |
 
 ## 🛠️ Comandos úteis
@@ -114,6 +166,7 @@ Os smoke tests usam portas locais `3000` e `5173`; encerre `dev:local` antes de 
 - [Ambiente de desenvolvimento no Windows](docs/ambiente-windows.md)
 - [Decisão de persistência local com SQLite](docs/adr/0002-persistencia-local-sqlite.md)
 - [Classificador de FAQ com Ollama](docs/ia-local-ollama.md)
+- [Gateway de IA compatível com OpenAI](docs/adr/0004-gateway-llm-compativel-com-openai.md)
 - [Contrato do envio WhatsApp de teste](docs/contrato-saida-whatsapp.md)
 - [Gateway local de webhook Cloudflare](docs/cloudflare-webhook-local.md)
 - [Demonstração em VPS sem Docker](docs/implantacao-vps-oracle.md)
