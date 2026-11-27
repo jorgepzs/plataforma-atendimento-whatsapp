@@ -36,6 +36,22 @@ export interface ConsumerOrderEventRecord {
   detailsRequestedAt: string | null;
 }
 
+export interface ConsumerRepository {
+  getConfig(tenantId: string): ConsumerPartnerConfigRecord | undefined;
+  findEnabledByTokenHash(tokenHash: string): ConsumerPartnerConfigRecord | undefined;
+  saveConfig(config: Omit<ConsumerPartnerConfigRecord, "tokenHash" | "tokenCreatedAt">, tokenHash: string, tokenCreatedAt: string): void;
+  rotateToken(tenantId: string, tokenHash: string, tokenCreatedAt: string): boolean;
+  saveOrderDetailsContext(tenantId: string, orderId: string, context: unknown, updatedAt: string): void;
+  getOrderDetailsContext<T>(tenantId: string, orderId: string): T | undefined;
+  ensureOrderEvent(tenantId: string, orderId: string, eventId: string, createdAt: string): ConsumerOrderEventRecord;
+  getOrderEvent(tenantId: string, orderId: string): ConsumerOrderEventRecord | undefined;
+  markOrderDetailsRequested(tenantId: string, orderId: string, at: string): void;
+  listPendingOrderEvents(tenantId: string): ConsumerOrderEventRecord[];
+  recordStatusCallback(tenantId: string, orderId: string, callbackHash: string, status: string, justification: string | undefined, receivedAt: string): boolean;
+  hasStatusCallback(tenantId: string, callbackHash: string): boolean;
+  countStatusCallbacks(tenantId: string, orderId: string): number;
+}
+
 function readConfig(row: Record<string, unknown> | undefined): ConsumerPartnerConfigRecord | undefined {
   if (!row) return undefined;
   return {
@@ -58,7 +74,7 @@ function readConfig(row: Record<string, unknown> | undefined): ConsumerPartnerCo
   };
 }
 
-export class SqliteConsumerRepository {
+export class SqliteConsumerRepository implements ConsumerRepository {
   constructor(private readonly database: SqliteLocalDatabase) {}
 
   getConfig(tenantId: string): ConsumerPartnerConfigRecord | undefined {

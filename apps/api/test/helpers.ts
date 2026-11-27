@@ -1,4 +1,4 @@
-import type { AppConfig } from "../src/config.js";
+import { defaultRagSettings, type AppConfig } from "../src/config.js";
 import type { NormalizedInboundMessage } from "../src/meta/inbound-message.js";
 import type { EnqueueInboundResult, InboundEventStore } from "../src/ports/inbound-event-store.js";
 import { disabledWhatsAppConfig } from "../src/whatsapp/settings.js";
@@ -16,6 +16,7 @@ export const testConfig: AppConfig = {
   localAiEnabled: false,
   whatsappOutboundEnabled: false,
   whatsappOutboundAllowedRecipients: [],
+  rag: defaultRagSettings(),
   whatsapp: disabledWhatsAppConfig()
 };
 

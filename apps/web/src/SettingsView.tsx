@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import type { Session, TenantConfig } from "./api";
+import type { AssistantMode, Session, TenantConfig } from "./api";
 import { ChipEditor, HoursFields, MoneyField, Section } from "./fields";
 import { useTenantConfig } from "./use-config";
 import { Button, Skeleton } from "./ui";
@@ -24,6 +24,7 @@ export function SettingsView({
   const [secret, setSecret] = useState("");
   const [fee, setFee] = useState(0);
   const [baseline, setBaseline] = useState("");
+
   const version = config?.version;
 
   useEffect(() => {
@@ -95,6 +96,18 @@ export function SettingsView({
           {!config.greeting.trim() && <small role="alert">Informe a saudação.</small>}
         </label>
         <label className="field">
+          <span>Motor do assistente</span>
+          <select
+            disabled={disabled}
+            value={config.assistantMode}
+            onChange={(event) => setConfig({ ...config, assistantMode: event.target.value as AssistantMode })}
+          >
+            <option value="approved_faq">FAQ aprovada (+ gateway LLM quando configurado)</option>
+            <option value="local_ai">Classificador local (Ollama)</option>
+          </select>
+          <small>Travas de segurança (palavras de handoff, opt-out e fila humana) continuam ativas em todos os modos.</small>
+        </label>
+        <label className="field">
           <span>Objetivo do bot</span>
           <textarea
             rows={3}
@@ -104,13 +117,14 @@ export function SettingsView({
             onChange={(event) => setConfig({ ...config, assistantObjective: event.target.value })}
             placeholder="Ex.: entender a necessidade do cliente e montar o pedido; ou coletar dados para preparar um orçamento."
           />
-          <small>Oriente o atendimento. O bot continuará usando os dados cadastrados e encaminhará o que depender de avaliação humana. Até 1000 caracteres.</small>
+          <small>Oriente o atendimento. O bot continuará usando os dados cadastrados, guardrails de segurança e encaminhará o que depender de avaliação humana. Até 1000 caracteres.</small>
         </label>
         <label className="check-line">
           <input type="checkbox" checked={config.orderingEnabled} disabled={disabled} onChange={(event) => setConfig({ ...config, orderingEnabled: event.target.checked })} />
           Assistente pode montar pedidos
         </label>
       </Section>
+
       <Section title="Entrega e pagamento">
         <div className="split-line">
           <label className="check-line">

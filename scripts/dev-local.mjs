@@ -5,7 +5,7 @@ import { createServer } from "node:net";
 import { resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseEnv } from "node:util";
-import { selectDocumentedEnvironment } from "./local-env.mjs";
+import { assertLocalPostgresUrl, selectDocumentedEnvironment, selectLocalStorageMode } from "./local-env.mjs";
 import { localSmokeCredentials, runSmoke } from "./smoke-local.mjs";
 
 const projectRoot = resolve(fileURLToPath(new URL("..", import.meta.url)));
@@ -18,9 +18,7 @@ const webPort = 5173;
 const apiBaseUrl = `http://127.0.0.1:${apiPort}`;
 const webBaseUrl = `http://127.0.0.1:${webPort}`;
 const runSmokeAfterStart = process.argv.includes("--smoke");
-const usePostgres = process.argv.includes("--postgres");
-const useMemory = process.argv.includes("--memory") || (runSmokeAfterStart && !process.argv.includes("--sqlite"));
-const useSqlite = !usePostgres && !useMemory;
+const { useMemory, useSqlite, usePostgres } = selectLocalStorageMode(process.argv);
 const migrateOnly = process.argv.includes("--migrate-only");
 const children = [];
 let stopping = false;
@@ -64,10 +62,7 @@ function loadPostgresEnvironment() {
   const filename = resolve(projectRoot, ".env.postgres.local");
   if (!existsSync(filename)) throw new Error('Execute "npm run db:setup" para configurar o banco local.');
   const environment = parseEnv(readFileSync(filename, "utf8"));
-  const url = new URL(environment.DATABASE_URL ?? "");
-  if (url.protocol !== "postgresql:" || url.hostname !== "127.0.0.1") {
-    throw new Error("O ambiente PostgreSQL local deve usar postgresql:// em 127.0.0.1.");
-  }
+  assertLocalPostgresUrl(environment.DATABASE_URL ?? "");
   return environment;
 }
 
@@ -181,16 +176,22 @@ async function waitForReady(name, url, child, validate) {
 
 async function main() {
   assertInstalledDependencies();
-  if (usePostgres && (process.argv.includes("--memory") || process.argv.includes("--sqlite"))) {
-    throw new Error("Escolha um único modo de armazenamento.");
-  }
   if (migrateOnly && !usePostgres) throw new Error("Migrações locais exigem --postgres.");
   if (!migrateOnly) await Promise.all([assertPortAvailable(apiPort), assertPortAvailable(webPort)]);
 
+  const envFromFile = documentedEnvironmentFromFile();
   let postgresEnvironment = {};
   if (usePostgres) {
-    await runTask("PostgreSQL local", [resolve(projectRoot, "scripts/postgres-local.mjs"), "start"], projectRoot);
-    postgresEnvironment = loadPostgresEnvironment();
+    if (process.env.DATABASE_URL || envFromFile.DATABASE_URL) {
+      const databaseUrl = process.env.DATABASE_URL || envFromFile.DATABASE_URL;
+      assertLocalPostgresUrl(databaseUrl);
+      postgresEnvironment = { DATABASE_URL: databaseUrl };
+    } else {
+      const localEnvFile = resolve(projectRoot, ".env.postgres.local");
+      const action = existsSync(localEnvFile) ? "start" : "setup";
+      await runTask("PostgreSQL local", [resolve(projectRoot, "scripts/postgres-local.mjs"), action], projectRoot);
+      postgresEnvironment = loadPostgresEnvironment();
+    }
   }
 
   const sqliteFilename = useSqlite
@@ -199,7 +200,7 @@ async function main() {
       : resolve(process.env.LOCAL_SQLITE_PATH || resolve(projectRoot, ".data/attendance.sqlite"))
     : "";
   const apiEnv = {
-    ...documentedEnvironmentFromFile(),
+    ...envFromFile,
     ...process.env,
     ...postgresEnvironment,
     NODE_ENV: "development",
@@ -208,6 +209,7 @@ async function main() {
     LOG_LEVEL: "info",
     DATABASE_URL: usePostgres ? postgresEnvironment.DATABASE_URL : "",
     LOCAL_SQLITE_PATH: sqliteFilename,
+    ...(usePostgres ? { WHATSAPP_TEST_UNLIMITED: "false", LOCAL_AI_ENABLED: "false" } : {}),
     META_VERIFY_TOKEN: localSmokeCredentials.verifyToken,
     META_APP_SECRET: localSmokeCredentials.appSecret,
     META_REQUIRE_SIGNATURE: "true",

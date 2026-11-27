@@ -236,8 +236,12 @@ describe("ordering conversation", () => {
           }
           return { ok: true, text: "Ficou R$ 71,00. Se estiver certo, responda SIM.", toolCalls: [], toolsDegraded: false };
         }
-        if (!sawTool) {
-          return { ok: true, text: "", toolsDegraded: false, toolCalls: [{ id: "ok", name: "confirm_order", arguments: { totalCents: 1 } }] };
+        const toolResults = request.messages.filter((message) => message.role === "tool");
+        if (toolResults.length === 0) {
+          return { ok: true, text: "", toolsDegraded: false, toolCalls: [{ id: "bad", name: "confirm_order", arguments: { totalCents: 1 } }] };
+        }
+        if (toolResults.length === 1 && toolResults[0]!.content.includes("forbidden_tool_argument")) {
+          return { ok: true, text: "", toolsDegraded: false, toolCalls: [{ id: "ok", name: "confirm_order", arguments: {} }] };
         }
         return { ok: true, text: "Pedido confirmado. Total R$ 71,00.", toolCalls: [], toolsDegraded: false };
       }

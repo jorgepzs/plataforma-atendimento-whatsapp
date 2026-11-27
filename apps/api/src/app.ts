@@ -1,13 +1,15 @@
 import Fastify, { type FastifyInstance } from "fastify";
 import rawBody from "fastify-raw-body";
 import { ZodError } from "zod";
-import type { AppConfig } from "./config.js";
+import { defaultRagSettings, type AppConfig } from "./config.js";
 import type { InboundEventStore } from "./ports/inbound-event-store.js";
 import { registerHealthRoutes } from "./routes/health.js";
 import { registerMetaWebhookRoutes } from "./routes/meta-webhook.js";
 import { registerSystemRoutes } from "./routes/system.js";
 import { MetaWebhookService } from "./services/meta-webhook-service.js";
 import { MemoryInboundEventStore } from "./infra/memory/memory-inbound-event-store.js";
+import { PostgresDatabase } from "./infra/postgres/postgres-database.js";
+import { PostgresInboundEventStore } from "./infra/postgres/postgres-inbound-event-store.js";
 import { LocalSessionManager, LocalHttpError } from "./auth/local-sessions.js";
 import { registerLocalAuthRoutes } from "./auth/local-auth-routes.js";
 import { LocalAttendanceService, AttendanceError } from "./attendance/service.js";
@@ -17,15 +19,27 @@ import { SqliteLocalDatabase } from "./infra/sqlite/local-database.js";
 import { SqliteInboundEventStore } from "./infra/sqlite/sqlite-inbound-event-store.js";
 import { OllamaKnowledgeAnswerSelector, type KnowledgeAnswerSelector } from "./attendance/knowledge-classifier.js";
 import { createLlmAssistant, isPrivateLlmHost, OpenAiCompatibleChatClient, type LlmChatClient } from "./llm/index.js";
+import {
+  MemoryRagRepository,
+  OpenAiCompatibleEmbeddingClient,
+  PostgresRagRepository,
+  SqliteRagRepository,
+  TenantRagService,
+  type EmbeddingClient
+} from "./rag/index.js";
 import { CloudApiTextSender } from "./infra/meta/cloud-api-text-sender.js";
 import type { OutboundTextSender } from "./ports/outbound-text-sender.js";
 import { allowPanelOrigins } from "./auth/local-sessions.js";
 import { createWhatsAppChannel, type WhatsAppChannel } from "./whatsapp/channel.js";
 import { registerWhatsAppRoutes } from "./whatsapp/routes.js";
 import { registerConsumerRoutes } from "./consumer/routes.js";
+import { SqliteConsumerRepository } from "./consumer/repository.js";
 
 declare module "fastify" {
-  interface FastifyInstance { localAttendanceService?: LocalAttendanceService }
+  interface FastifyInstance {
+    localAttendanceService?: LocalAttendanceService;
+    ragService?: TenantRagService;
+  }
 }
 
 export interface BuildAppOptions {
@@ -33,8 +47,10 @@ export interface BuildAppOptions {
   store: InboundEventStore;
   logger?: boolean;
   localDatabase?: SqliteLocalDatabase;
+  postgresDatabase?: PostgresDatabase;
   knowledgeAnswerSelector?: KnowledgeAnswerSelector;
   llmClient?: LlmChatClient;
+  ragEmbeddingClient?: EmbeddingClient;
   outboundSender?: OutboundTextSender;
   now?: () => Date;
 }
@@ -59,13 +75,22 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   if (options.localDatabase && (!options.config.localDemoEnabled || !(options.store instanceof SqliteInboundEventStore) || options.store.database !== options.localDatabase)) {
     throw new Error("O banco local deve pertencer ao store SQLite e ao atendimento local habilitado.");
   }
+  const postgresBacked = Boolean(
+    options.postgresDatabase &&
+    options.store instanceof PostgresInboundEventStore &&
+    options.store.database === options.postgresDatabase
+  );
+  if (options.postgresDatabase && !postgresBacked) {
+    throw new Error("O banco PostgreSQL deve pertencer ao PostgresInboundEventStore informado.");
+  }
   if (options.config.whatsapp.enabled && (
-    !(options.store instanceof SqliteInboundEventStore) ||
-    !(options.localDatabase instanceof SqliteLocalDatabase) ||
-    options.store.database !== options.localDatabase ||
+    !(
+      (options.store instanceof SqliteInboundEventStore && options.localDatabase instanceof SqliteLocalDatabase && options.store.database === options.localDatabase) ||
+      postgresBacked
+    ) ||
     !options.config.whatsapp.sessionDir
   )) {
-    throw new Error("O canal WhatsApp exige SQLite local e um diretório de sessão.");
+    throw new Error("O canal WhatsApp exige PostgreSQL ou SQLite e um diretório de sessão.");
   }
   if (options.config.whatsappOutboundEnabled && (
     !options.config.localDemoEnabled || options.config.nodeEnv === "production" || options.config.databaseUrl ||
@@ -90,9 +115,11 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
                 "req.headers.x-csrf-token",
                 "res.headers.set-cookie",
                 "req.body.password",
+                "req.body.apiKey",
                 "req.body.llm.apiKey",
                 "req.body.metaAccessToken",
                 "req.headers.xapikey",
+                "req.headers.xi-api-key",
                 "res.body.apiToken",
                 "req.headers.x-hub-signature-256",
                 "req.body.entry[*].changes[*].value.contacts",
@@ -138,8 +165,16 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
   const webhookService = new MetaWebhookService(options.store);
   allowPanelOrigins(options.config.whatsapp.panelOrigins);
 
-  const attendanceEnabled = Boolean(options.config.localDemoEnabled || options.config.whatsapp.enabled);
-  if (attendanceEnabled && (options.store instanceof MemoryInboundEventStore || options.store instanceof SqliteInboundEventStore)) {
+  const attendanceEnabled = Boolean(
+    options.config.localDemoEnabled || options.config.whatsapp.enabled || postgresBacked
+  );
+  const ragSettings = options.config.rag ?? defaultRagSettings();
+  let ragActiveStorage: "sqlite" | "postgres" | "memory" | null = null;
+  if (attendanceEnabled && (
+    options.store instanceof MemoryInboundEventStore ||
+    options.store instanceof SqliteInboundEventStore ||
+    (options.store instanceof PostgresInboundEventStore && Boolean(options.postgresDatabase))
+  )) {
     const outboundSender = options.config.whatsappOutboundEnabled
       ? options.outboundSender ?? new CloudApiTextSender({
           enabled: true,
@@ -152,10 +187,39 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       customer?: (event: CustomerMessageNotice) => void;
       outbound?: (event: OutboundMessageNotice) => void;
     } = {};
+    const ragRepository = options.postgresDatabase
+      ? new PostgresRagRepository(options.postgresDatabase.pool)
+      : options.localDatabase
+        ? new SqliteRagRepository(options.localDatabase)
+        : new MemoryRagRepository();
+    ragActiveStorage = options.postgresDatabase ? "postgres" : options.localDatabase ? "sqlite" : "memory";
+    const ragEmbeddingClient = options.ragEmbeddingClient ?? (
+      ragSettings.embeddingProvider !== "none" && ragSettings.embeddingBaseUrl && ragSettings.embeddingModel
+        ? new OpenAiCompatibleEmbeddingClient({
+            baseUrl: ragSettings.embeddingBaseUrl,
+            model: ragSettings.embeddingModel,
+            ...(ragSettings.embeddingApiKey ? { apiKey: ragSettings.embeddingApiKey } : {}),
+            timeoutMs: ragSettings.timeoutMs,
+            ...(llmSettings?.httpReferer ? { httpReferer: llmSettings.httpReferer } : {}),
+            ...(llmSettings?.appTitle ? { appTitle: llmSettings.appTitle } : {})
+          })
+        : undefined
+    );
+    const ragService = new TenantRagService({
+      repository: ragRepository,
+      settings: ragSettings,
+      ...(ragEmbeddingClient ? { embeddingClient: ragEmbeddingClient } : {}),
+      ...(options.now ? { now: options.now } : {})
+    });
+    const attendanceRepository = options.postgresDatabase?.attendanceRepository ?? options.localDatabase?.attendanceRepository;
+    const identityRepository = options.postgresDatabase?.identityRepository ?? options.localDatabase?.identityRepository;
+    const consumerRepository = options.postgresDatabase?.consumerRepository ?? (
+      options.localDatabase ? new SqliteConsumerRepository(options.localDatabase) : undefined
+    );
     const service = new LocalAttendanceService(options.store, {
       ...(options.now ? { now: options.now } : {}),
       botSessionTtlMs: options.config.botSessionTtlMinutes * 60_000,
-      ...(options.localDatabase ? { repository: options.localDatabase.attendanceRepository } : {}),
+      ...(attendanceRepository ? { repository: attendanceRepository } : {}),
       outbound: {
         enabled: options.config.whatsappOutboundEnabled,
         graphApiVersion: options.config.metaGraphApiVersion,
@@ -169,12 +233,13 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
         ? { knowledgeAnswerSelector: options.knowledgeAnswerSelector ?? new OllamaKnowledgeAnswerSelector({ model: options.config.localAiModel }) }
         : {}),
       ...(llmSettings && llmClient ? { llmAssistant: createLlmAssistant(llmClient, llmSettings) } : {}),
+      ragService,
       onCustomerMessage: (event) => channelBridge.customer?.(event),
       onOutboundMessage: (event) => channelBridge.outbound?.(event)
     });
-    const sessions = new LocalSessionManager(Date.now, options.localDatabase?.identityRepository);
+    const sessions = new LocalSessionManager(Date.now, identityRepository, options.config.nodeEnv !== "production");
     let channel: WhatsAppChannel | undefined;
-    if (options.config.whatsapp.enabled && options.store instanceof SqliteInboundEventStore) {
+    if (options.config.whatsapp.enabled && (options.store instanceof SqliteInboundEventStore || postgresBacked)) {
       channel = createWhatsAppChannel({
         config: options.config.whatsapp,
         graphApiVersion: options.config.metaGraphApiVersion,
@@ -198,6 +263,7 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       channelBridge.outbound = (event) => channel?.handleOutbound(event);
     }
     app.decorate("localAttendanceService", service);
+    app.decorate("ragService", ragService);
     app.addHook("onRequest", async (request, reply) => {
       if (request.url.startsWith("/api/v1/")) reply.header("cache-control", "no-store");
     });
@@ -216,16 +282,21 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       }
     } : undefined);
     await registerWhatsAppRoutes(app, sessions, channel);
-    if (options.localDatabase) {
+    if (consumerRepository) {
       await registerConsumerRoutes(app, {
-        database: options.localDatabase,
+        repository: consumerRepository,
         service,
         sessions,
+        ...(options.postgresDatabase ? { flushPersistence: () => options.postgresDatabase!.flush() } : {}),
         ...(options.now ? { now: options.now } : {})
       });
     }
     app.addHook("onReady", async () => { service.startWorker(); if (channel) await channel.start(); });
-    app.addHook("preClose", async () => { await service.stopWorker(); if (channel) await channel.stop(); });
+    app.addHook("preClose", async () => {
+      await service.stopWorker();
+      if (channel) await channel.stop();
+      if (options.postgresDatabase) await options.postgresDatabase.flush();
+    });
     app.addHook("onClose", async () => { sessions.close(); });
   }
 
@@ -237,7 +308,16 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
     options.config.localAiEnabled,
     options.config.whatsappOutboundEnabled,
     llmSettings ? { provider: llmSettings.provider, model: llmSettings.model } : null,
-    options.config.whatsapp.enabled ? { provider: options.config.whatsapp.provider } : null
+    options.config.whatsapp.enabled ? { provider: options.config.whatsapp.provider } : null,
+    ragActiveStorage
+      ? {
+          enabled: ragSettings.enabled,
+          storage: ragActiveStorage,
+          embeddingProvider: ragSettings.embeddingProvider,
+          ...(ragSettings.embeddingModel ? { embeddingModel: ragSettings.embeddingModel } : {})
+        }
+      : null,
+    postgresBacked
   );
   await registerMetaWebhookRoutes(app, options.config, webhookService);
 

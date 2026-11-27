@@ -1,0 +1,52 @@
+[Unit]
+Description=Plataforma de Atendimento WhatsApp API
+Documentation=https://github.com/jorgepzs/plataforma-atendimento-whatsapp
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=atende
+Group=atende
+WorkingDirectory=/opt/plataforma-atendimento/apps/api
+EnvironmentFile=/etc/plataforma-atendimento/api.env
+ExecStart=/usr/bin/node /opt/plataforma-atendimento/apps/api/dist/server.js
+
+# Recuperacao controlada sem loop infinito
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=300
+StartLimitBurst=5
+TimeoutStopSec=25
+KillSignal=SIGTERM
+
+# Limites para Oracle Cloud Always Free (bootstrap-vps.sh ajusta MemoryMax via drop-in)
+# VM.Standard.E2.1.Micro (1 GB RAM + 2 GB swap): recomenda-se 700M
+# VM.Standard.A1.Flex (6 GB a 24 GB RAM): pode subir para 1536M ou mais
+MemoryMax=768M
+TasksMax=128
+LimitNOFILE=16384
+
+# Endurecimento systemd (menor privilegio)
+NoNewPrivileges=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+LockPersonality=true
+CapabilityBoundingSet=
+AmbientCapabilities=
+UMask=0077
+ReadWritePaths=/var/lib/plataforma-atendimento
+
+# Logs controlados pelo journald (com limite em /etc/systemd/journald.conf.d/99-atende-free-tier.conf)
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=atende-api
+
+[Install]
+WantedBy=multi-user.target

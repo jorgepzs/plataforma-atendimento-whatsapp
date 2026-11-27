@@ -81,14 +81,14 @@ async function requireBinary(path) {
   }
 }
 
-function runExecutable(executable, args, timeoutMs = 180_000) {
+function runExecutable(executable, args, timeoutMs = 180_000, { ignoreStdio = false } = {}) {
   return new Promise((resolveRun, rejectRun) => {
     let child;
     try {
       child = spawn(executable, args, {
         cwd: projectRoot,
         windowsHide: true,
-        stdio: ["ignore", "pipe", "pipe"]
+        stdio: ignoreStdio ? "ignore" : ["ignore", "pipe", "pipe"]
       });
     } catch (error) {
       rejectRun(
@@ -113,14 +113,18 @@ function runExecutable(executable, args, timeoutMs = 180_000) {
       rejectRun(error);
     }
 
-    child.stdout.setEncoding("utf8");
-    child.stderr.setEncoding("utf8");
-    child.stdout.on("data", (chunk) => {
-      stdout += chunk;
-    });
-    child.stderr.on("data", (chunk) => {
-      stderr += chunk;
-    });
+    if (child.stdout) {
+      child.stdout.setEncoding("utf8");
+      child.stdout.on("data", (chunk) => {
+        stdout += chunk;
+      });
+    }
+    if (child.stderr) {
+      child.stderr.setEncoding("utf8");
+      child.stderr.on("data", (chunk) => {
+        stderr += chunk;
+      });
+    }
     child.once("error", (error) => {
       finishReject(
         new LocalPostgresError(
@@ -128,7 +132,7 @@ function runExecutable(executable, args, timeoutMs = 180_000) {
         )
       );
     });
-    child.once("close", (code, signal) => {
+    child.once(ignoreStdio ? "exit" : "close", (code, signal) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
@@ -147,8 +151,8 @@ function describeToolFailure(executable, result) {
   );
 }
 
-async function runChecked(executable, args, timeoutMs) {
-  const result = await runExecutable(executable, args, timeoutMs);
+async function runChecked(executable, args, timeoutMs, options) {
+  const result = await runExecutable(executable, args, timeoutMs, options);
   if (result.code !== 0) throw describeToolFailure(executable, result);
   return result;
 }
@@ -587,7 +591,8 @@ async function startCluster(state) {
       "-o",
       `-h ${host} -p ${port}`
     ],
-    60_000
+    60_000,
+    { ignoreStdio: true }
   );
   await inspectCluster(state);
   console.log("PostgreSQL local iniciado em 127.0.0.1:5432.");

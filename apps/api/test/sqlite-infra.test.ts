@@ -54,7 +54,7 @@ describe("SQLite local infrastructure", () => {
     });
     database.attendanceRepository.save(snapshot);
     expect(database.attendanceRepository.load()).toEqual(snapshot);
-      expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 10 });
+    expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 12 });
 
     const qrSnapshot: AttendanceSnapshot = {
       ...snapshot,
@@ -120,6 +120,7 @@ describe("SQLite local infrastructure", () => {
       DROP TABLE IF EXISTS consumer_order_events;
       DROP TABLE IF EXISTS consumer_order_details_contexts;
       DROP TABLE IF EXISTS consumer_partner_configs;
+      DROP TABLE IF EXISTS rag_knowledge_chunks;
       DELETE FROM schema_migrations WHERE version >= 4;
       PRAGMA user_version = 3;
       COMMIT;
@@ -129,7 +130,7 @@ describe("SQLite local infrastructure", () => {
 
     database = new SqliteLocalDatabase(filename);
     expect(database.attendanceRepository.load()).toEqual(snapshot);
-      expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 10 });
+      expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 12 });
   });
 
   it("persists identity hashes and sessions without plaintext credentials", () => {
