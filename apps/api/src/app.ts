@@ -22,6 +22,7 @@ import type { OutboundTextSender } from "./ports/outbound-text-sender.js";
 import { allowPanelOrigins } from "./auth/local-sessions.js";
 import { createWhatsAppChannel, type WhatsAppChannel } from "./whatsapp/channel.js";
 import { registerWhatsAppRoutes } from "./whatsapp/routes.js";
+import { registerConsumerRoutes } from "./consumer/routes.js";
 
 declare module "fastify" {
   interface FastifyInstance { localAttendanceService?: LocalAttendanceService }
@@ -35,6 +36,7 @@ export interface BuildAppOptions {
   knowledgeAnswerSelector?: KnowledgeAnswerSelector;
   llmClient?: LlmChatClient;
   outboundSender?: OutboundTextSender;
+  now?: () => Date;
 }
 
 export async function buildApp(options: BuildAppOptions): Promise<FastifyInstance> {
@@ -90,6 +92,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
                 "req.body.password",
                 "req.body.llm.apiKey",
                 "req.body.metaAccessToken",
+                "req.headers.xapikey",
+                "res.body.apiToken",
                 "req.headers.x-hub-signature-256",
                 "req.body.entry[*].changes[*].value.contacts",
                 "req.body.entry[*].changes[*].value.messages"
@@ -149,6 +153,8 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       outbound?: (event: OutboundMessageNotice) => void;
     } = {};
     const service = new LocalAttendanceService(options.store, {
+      ...(options.now ? { now: options.now } : {}),
+      botSessionTtlMs: options.config.botSessionTtlMinutes * 60_000,
       ...(options.localDatabase ? { repository: options.localDatabase.attendanceRepository } : {}),
       outbound: {
         enabled: options.config.whatsappOutboundEnabled,
@@ -210,6 +216,14 @@ export async function buildApp(options: BuildAppOptions): Promise<FastifyInstanc
       }
     } : undefined);
     await registerWhatsAppRoutes(app, sessions, channel);
+    if (options.localDatabase) {
+      await registerConsumerRoutes(app, {
+        database: options.localDatabase,
+        service,
+        sessions,
+        ...(options.now ? { now: options.now } : {})
+      });
+    }
     app.addHook("onReady", async () => { service.startWorker(); if (channel) await channel.start(); });
     app.addHook("preClose", async () => { await service.stopWorker(); if (channel) await channel.stop(); });
     app.addHook("onClose", async () => { sessions.close(); });

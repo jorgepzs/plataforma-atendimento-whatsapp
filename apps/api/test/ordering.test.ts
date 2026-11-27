@@ -89,7 +89,7 @@ describe("order tools", () => {
     expect((await tools.execute("confirm_order", {})).error).toBe("summary_not_presented");
     expect((await tools.execute("get_order_summary", {})).ok).toBe(true);
     expect(tools.order()?.status).toBe("awaiting_confirmation");
-    expect((await tools.execute("confirm_order", { confirmed: true })).error).toBe("customer_has_not_confirmed");
+    expect((await tools.execute("confirm_order", { confirmed: true })).error).toBe("summary_presented_this_turn");
 
     const ready = session("sim", undefined, tools.order());
     const confirmed = await ready.execute("confirm_order", { totalCents: 1 });
@@ -97,6 +97,17 @@ describe("order tools", () => {
     expect(ready.order()?.status).toBe("confirmed");
     expect(ready.order()?.totalCents).toBe(700);
     expect(ready.order()?.integrationReference).toBe("local");
+  });
+
+  it("não confirma quando o resumo e o SIM acontecem no mesmo turno", async () => {
+    const tools = session("sim");
+    await tools.execute("add_item", { itemId: "coca-lata", quantity: 1 });
+    await tools.execute("set_fulfillment", { method: "pickup" });
+    await tools.execute("get_order_summary", {});
+
+    const confirmation = await tools.execute("confirm_order", {});
+    expect(confirmation.error).toBe("summary_presented_this_turn");
+    expect(tools.order()?.status).toBe("awaiting_confirmation");
   });
 });
 
@@ -273,5 +284,69 @@ describe("ordering conversation", () => {
     await service.processPending();
     expect(service.listConversations("barbearia-demo")[0]?.state).toBe("WAITING_HUMAN");
     expect(service.listOrders("barbearia-demo")).toEqual([]);
+  });
+
+  it("usa resumo calculado no servidor e não aceita SIM se o resumo anterior falhou", async () => {
+    const client: LlmChatClient = {
+      async complete(request) {
+        const customer = [...request.messages].reverse().find((message) => message.role === "user")?.content ?? "";
+        const sawTool = request.messages.some((message) => message.role === "tool");
+        if (customer === "quero uma coca para retirada" && !sawTool) {
+          return {
+            ok: true,
+            text: "",
+            toolsDegraded: false,
+            toolCalls: [
+              { id: "add", name: "add_item", arguments: { itemId: "coca-lata", quantity: 1 } },
+              { id: "pickup", name: "set_fulfillment", arguments: { method: "pickup" } },
+              { id: "summary", name: "get_order_summary", arguments: {} }
+            ]
+          };
+        }
+        if (customer === "sim" && !sawTool) {
+          return {
+            ok: true,
+            text: "",
+            toolsDegraded: false,
+            toolCalls: [
+              { id: "summary-again", name: "get_order_summary", arguments: {} },
+              { id: "confirm", name: "confirm_order", arguments: {} }
+            ]
+          };
+        }
+        return { ok: true, text: "Pode confirmar?", toolsDegraded: false, toolCalls: [] };
+      }
+    };
+    const service = new LocalAttendanceService(new MemoryInboundEventStore(), {
+      llmAssistant: createLlmAssistant(client, settings()),
+      workerIntervalMs: 60_000
+    });
+    await service.simulateMessage("pizzaria-demo", {
+      customerName: "Ana",
+      customerPhone: "5511991000089",
+      text: "quero uma coca para retirada",
+      clientMessageId: "order-summary-delivery-1"
+    });
+    await service.processPending();
+
+    const conversation = service.listConversations("pizzaria-demo")[0]!;
+    const firstSummary = service.getConversation("pizzaria-demo", conversation.id).messages.at(-1)!;
+    expect(firstSummary.text).toContain("Resumo do pedido:");
+    expect(firstSummary.text).toContain("Total: R$ 7,00");
+    expect(service.listOrders("pizzaria-demo")[0]?.status).toBe("awaiting_confirmation");
+    service.markDelivery("pizzaria-demo", firstSummary.id, { status: "BLOCKED", resultCode: "not_delivered" });
+
+    await service.simulateMessage("pizzaria-demo", {
+      customerName: "Ana",
+      customerPhone: "5511991000089",
+      text: "sim",
+      clientMessageId: "order-summary-delivery-2"
+    });
+    await service.processPending();
+
+    expect(service.listOrders("pizzaria-demo")[0]?.status).toBe("awaiting_confirmation");
+    const finalConversation = service.getConversation("pizzaria-demo", conversation.id);
+    expect(finalConversation.messages.at(-1)?.text).toContain("Resumo do pedido:");
+    expect(finalConversation.messages.at(-1)?.text).toContain("Total: R$ 7,00");
   });
 });

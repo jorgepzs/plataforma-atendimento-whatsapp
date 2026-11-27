@@ -59,7 +59,11 @@ test('local-managed ingress config pins the hostname to the isolated gateway and
     '  - service: http_status:404',
     '',
   ].join('\n'));
-  assert.throws(() => localManagedTunnelYaml({ tunnelId, credentialsFile: `C:\\Users\\user\\${tunnelId}.json\n  - service: http://127.0.0.1:3000` }), { message: 'CLOUDFLARE_LOCAL_TUNNEL_CONFIG_INVALID' });
+  assert.throws(() => localManagedTunnelYaml({
+    tunnelId,
+    credentialsFile: `C:\\Users\\user\\${tunnelId}.json\n  - service: http://127.0.0.1:3000`,
+    hostname,
+  }), { message: 'CLOUDFLARE_LOCAL_TUNNEL_CONFIG_INVALID' });
 });
 test('local-managed cloudflared arguments refer to the generated config and UUID, never credentials', () => {
   const tunnelId = '550e8400-e29b-41d4-a716-446655440000';

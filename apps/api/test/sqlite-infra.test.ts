@@ -35,6 +35,12 @@ describe("SQLite local infrastructure", () => {
     expect(database.attendanceRepository.load()).toBeUndefined();
 
     const snapshot = attendanceSnapshot();
+    snapshot.botSessions = [{
+      id: "bot-session-1", tenantId: "tenant-1", customerPhone: "+5511000000000",
+      conversationId: "conversation-1", startedAt: "2026-10-03T10:00:00.000Z",
+      lastActivityAt: "2026-10-03T10:00:00.000Z", activeOrderId: null
+    }];
+    snapshot.messages[0]!.botSessionId = "bot-session-1";
     snapshot.messages.push({
       id: "message-2", conversationId: "conversation-1", role: "BOT", text: "Olá",
       createdAt: "2026-10-03T10:01:00.000Z", deliveryStatus: "SIMULATED", authorName: null
@@ -48,7 +54,7 @@ describe("SQLite local infrastructure", () => {
     });
     database.attendanceRepository.save(snapshot);
     expect(database.attendanceRepository.load()).toEqual(snapshot);
-    expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 7 });
+      expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 10 });
 
     const qrSnapshot: AttendanceSnapshot = {
       ...snapshot,
@@ -109,6 +115,11 @@ describe("SQLite local infrastructure", () => {
       ALTER TABLE attendance_conversations DROP COLUMN last_inbound_phone_number_id;
       ALTER TABLE attendance_conversations DROP COLUMN last_inbound_at;
       DROP TABLE IF EXISTS attendance_orders;
+      DROP TABLE IF EXISTS attendance_bot_sessions;
+      DROP TABLE IF EXISTS consumer_order_status_callbacks;
+      DROP TABLE IF EXISTS consumer_order_events;
+      DROP TABLE IF EXISTS consumer_order_details_contexts;
+      DROP TABLE IF EXISTS consumer_partner_configs;
       DELETE FROM schema_migrations WHERE version >= 4;
       PRAGMA user_version = 3;
       COMMIT;
@@ -118,7 +129,7 @@ describe("SQLite local infrastructure", () => {
 
     database = new SqliteLocalDatabase(filename);
     expect(database.attendanceRepository.load()).toEqual(snapshot);
-    expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 7 });
+      expect(database.prepare("PRAGMA user_version").get()).toEqual({ user_version: 10 });
   });
 
   it("persists identity hashes and sessions without plaintext credentials", () => {
@@ -255,7 +266,7 @@ function attendanceSnapshot(): AttendanceSnapshot {
         channelPhoneNumberId: "phone-1"
       },
       config: {
-        businessName: "Tenant One", segment: "outro", greeting: "Olá", knowledge: [],
+        businessName: "Tenant One", segment: "outro", assistantObjective: "", greeting: "Olá", knowledge: [],
         handoffKeywords: ["ajuda"], assistantMode: "approved_faq", version: 1,
         profile: {
           address: "", serviceArea: "", hours: "", deliveryEnabled: false, pickupEnabled: false,

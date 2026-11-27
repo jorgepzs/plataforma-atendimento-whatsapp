@@ -36,6 +36,7 @@ export interface PolicyInput {
   recentIdenticalRecipients: number;
   random: () => number;
   settings: AntiBanSettings;
+  testUnlimitedMode?: boolean;
 }
 
 export type PolicyDecision =
@@ -98,46 +99,50 @@ export function evaluateOutbound(input: PolicyInput): PolicyDecision {
     if (!contact?.firstInboundAt) return { allow: false, reason: "no_prior_inbound" };
     if (!contact.optedIn) return { allow: false, reason: "missing_opt_in" };
     if (contact.optedOut) return { allow: false, reason: "opted_out" };
-    if (isQuietHours(input.now, input.settings.quietHoursStart, input.settings.quietHoursEnd, input.settings.quietHoursTimeZone)) {
+    if (!input.testUnlimitedMode && isQuietHours(input.now, input.settings.quietHoursStart, input.settings.quietHoursEnd, input.settings.quietHoursTimeZone)) {
       return { allow: false, reason: "quiet_hours" };
     }
   } else if (!contact?.firstInboundAt) {
     return { allow: false, reason: "no_prior_inbound" };
   }
 
-  const warmup = inWarmup(input.pairedAt, input.now, input.settings.warmupDays);
-  const perMinute = warmup
-    ? Math.min(input.settings.messagesPerMinute, input.settings.warmupMessagesPerMinute)
-    : input.settings.messagesPerMinute;
-  const perHour = warmup
-    ? Math.min(input.settings.messagesPerHour, input.settings.warmupMessagesPerHour)
-    : input.settings.messagesPerHour;
-  const perDay = warmup
-    ? Math.min(input.settings.dailyCap, input.settings.warmupDailyCap)
-    : input.settings.dailyCap;
-  const contactPerMinute = Math.min(input.settings.perContactPerMinute, warmup ? input.settings.warmupMessagesPerMinute : input.settings.perContactPerMinute);
-  const contactPerHour = Math.min(input.settings.perContactPerHour, warmup ? input.settings.warmupMessagesPerHour : input.settings.perContactPerHour);
-  const contactPerDay = warmup
-    ? Math.min(input.settings.perContactDailyCap, input.settings.warmupPerContactDailyCap)
-    : input.settings.perContactDailyCap;
+  if (!input.testUnlimitedMode) {
+    const warmup = inWarmup(input.pairedAt, input.now, input.settings.warmupDays);
+    const perMinute = warmup
+      ? Math.min(input.settings.messagesPerMinute, input.settings.warmupMessagesPerMinute)
+      : input.settings.messagesPerMinute;
+    const perHour = warmup
+      ? Math.min(input.settings.messagesPerHour, input.settings.warmupMessagesPerHour)
+      : input.settings.messagesPerHour;
+    const perDay = warmup
+      ? Math.min(input.settings.dailyCap, input.settings.warmupDailyCap)
+      : input.settings.dailyCap;
+    const contactPerMinute = Math.min(input.settings.perContactPerMinute, warmup ? input.settings.warmupMessagesPerMinute : input.settings.perContactPerMinute);
+    const contactPerHour = Math.min(input.settings.perContactPerHour, warmup ? input.settings.warmupMessagesPerHour : input.settings.perContactPerHour);
+    const contactPerDay = warmup
+      ? Math.min(input.settings.perContactDailyCap, input.settings.warmupPerContactDailyCap)
+      : input.settings.perContactDailyCap;
 
-  if (input.global.minute >= perMinute) return { allow: false, reason: "rate_minute" };
-  if (input.global.hour >= perHour) return { allow: false, reason: "rate_hour" };
-  if (input.global.day >= perDay) return { allow: false, reason: "rate_day" };
-  if (input.contactBucket.minute >= contactPerMinute) return { allow: false, reason: "contact_rate_minute" };
-  if (input.contactBucket.hour >= contactPerHour) return { allow: false, reason: "contact_rate_hour" };
-  if (input.contactBucket.day >= contactPerDay) return { allow: false, reason: "contact_rate_day" };
+    if (input.global.minute >= perMinute) return { allow: false, reason: "rate_minute" };
+    if (input.global.hour >= perHour) return { allow: false, reason: "rate_hour" };
+    if (input.global.day >= perDay) return { allow: false, reason: "rate_day" };
+    if (input.contactBucket.minute >= contactPerMinute) return { allow: false, reason: "contact_rate_minute" };
+    if (input.contactBucket.hour >= contactPerHour) return { allow: false, reason: "contact_rate_hour" };
+    if (input.contactBucket.day >= contactPerDay) return { allow: false, reason: "contact_rate_day" };
+  }
 
-  if (text && linkCount(text) > input.settings.maxLinksPerMessage) return { allow: false, reason: "too_many_links" };
+  if (!input.testUnlimitedMode && text && linkCount(text) > input.settings.maxLinksPerMessage) return { allow: false, reason: "too_many_links" };
 
   const fingerprint = textFingerprint(text);
   const lastAt = contact?.lastOutboundAt ? Date.parse(contact.lastOutboundAt) : Number.NaN;
   const sameContact = contact?.lastOutboundText === fingerprint
     && Number.isFinite(lastAt)
     && input.now.getTime() - lastAt < input.settings.duplicateCooldownMs;
-  if (sameContact) return { allow: false, reason: "duplicate_text" };
-  if (input.recentIdenticalRecipients >= input.settings.massIdenticalLimit) {
-    return { allow: false, reason: "mass_identical" };
+  if (!input.testUnlimitedMode) {
+    if (sameContact) return { allow: false, reason: "duplicate_text" };
+    if (input.recentIdenticalRecipients >= input.settings.massIdenticalLimit) {
+      return { allow: false, reason: "mass_identical" };
+    }
   }
 
   const chunks = text ? splitOutboundText(text, input.settings.maxMessageChars) : [];
@@ -148,9 +153,9 @@ export function evaluateOutbound(input: PolicyInput): PolicyDecision {
     reason: "ok",
     text,
     chunks,
-    delayMs: jitterDelay(input.settings.minDelayMs, input.settings.maxDelayMs, input.random, extra),
+    delayMs: input.testUnlimitedMode ? 0 : jitterDelay(input.settings.minDelayMs, input.settings.maxDelayMs, input.random, extra),
     markRead: input.settings.markAsRead && input.kind === "reply",
-    sendTyping: input.settings.sendTyping,
+    sendTyping: !input.testUnlimitedMode && input.settings.sendTyping,
     fingerprint,
     consumeNotice: notice
   };

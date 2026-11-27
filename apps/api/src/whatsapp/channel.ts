@@ -10,6 +10,7 @@ import type { AntiBanOverride, WhatsAppChannelConfig } from "./settings.js";
 import { publicAntiBan } from "./settings.js";
 import { blankTenant, ChannelStateStore } from "./state-store.js";
 import { maskPhone, optOutConfirmationText, safeTenantId } from "./text.js";
+import type { WhatsAppSendObservabilitySnapshot } from "./send-observability.js";
 import type { WhatsAppInboundMessage, WhatsAppProviderId, WhatsAppStatus, WhatsAppTransport } from "./types.js";
 
 export interface DeliveryUpdate {
@@ -44,6 +45,7 @@ export interface WhatsAppUsageView {
 
 export interface WhatsAppPublicView {
   enabled: true;
+  testUnlimitedMode: boolean;
   provider: WhatsAppProviderId;
   status: WhatsAppStatus["status"];
   halted: boolean;
@@ -57,6 +59,7 @@ export interface WhatsAppPublicView {
   proactiveEnabled: boolean;
   antiBan: ReturnType<typeof publicAntiBan>;
   usage: WhatsAppUsageView;
+  sendObservability: WhatsAppSendObservabilitySnapshot;
 }
 
 function stateFile(config: WhatsAppChannelConfig): string | undefined {
@@ -92,6 +95,7 @@ export class WhatsAppChannel {
     const settings = this.provider.settingsFor(tenantId);
     return {
       enabled: true,
+      testUnlimitedMode: this.options.config.testUnlimitedMode,
       provider: status.provider,
       status: status.status,
       halted: status.halted,
@@ -104,7 +108,8 @@ export class WhatsAppChannel {
       metaConfigured: Boolean((tenant?.metaPhoneNumberId || this.options.config.metaPhoneNumberId) && (tenant?.metaAccessToken || this.options.config.metaAccessToken)),
       proactiveEnabled: settings.proactiveEnabled,
       antiBan: publicAntiBan(settings),
-      usage: this.provider.usageSnapshot(tenantId)
+      usage: this.provider.usageSnapshot(tenantId),
+      sendObservability: this.provider.sendObservabilitySnapshot(tenantId)
     };
   }
 
@@ -258,6 +263,7 @@ export function createWhatsAppChannel(options: CreateChannelOptions): WhatsAppCh
     store,
     settings: options.config.antiBan,
     defaultProvider: options.config.provider,
+    testUnlimitedMode: options.config.testUnlimitedMode,
     clock,
     onAlert: (alert) => {
       const phone = store.snapshot().tenants[alert.tenantId]?.phoneNumber;

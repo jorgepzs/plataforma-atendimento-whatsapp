@@ -10,6 +10,7 @@ import type {
   CustomerMessageNotice,
   AttendanceSnapshot,
   AttendanceStateRepository,
+  BotConversationSession,
   KnowledgeEntry,
   LocalOutboundOptions,
   Message,
@@ -35,16 +36,20 @@ import {
   copyProfile,
   createWebhookOrderSink,
   emptyProfile,
+  isHistoricalOrderInquiry,
+  isHistoricalOrderRepeatRequest,
   isOrderIntent,
   isSchedulingOrQuote,
+  quoteLine,
   textMentionsItem,
   OrderSession,
   pizzariaCatalog,
   pizzariaProfile,
+  type CatalogItem,
   type CustomerOrder,
   type OrderSink
 } from "../ordering/index.js";
-import { CatalogError } from "../ordering/catalog.js";
+import { CatalogError, summarizeOrder } from "../ordering/catalog.js";
 
 export class AttendanceError extends Error {
   readonly statusCode: number;
@@ -67,6 +72,7 @@ interface ServiceOptions {
   now?: () => Date;
   createId?: () => string;
   workerIntervalMs?: number;
+  botSessionTtlMs?: number;
   repository?: AttendanceStateRepository;
   knowledgeAnswerSelector?: KnowledgeAnswerSelector;
   llmAssistant?: LlmAssistant;
@@ -77,6 +83,8 @@ interface ServiceOptions {
 }
 
 const outboundServiceWindowMs = 24 * 60 * 60 * 1_000;
+const defaultBotSessionTtlMs = 60 * 60 * 1_000;
+const maxBotSessionMessages = 8;
 
 const defaultKnowledge: Record<"pizzaria" | "barbearia", KnowledgeEntry[]> = {
   pizzaria: [
@@ -174,6 +182,7 @@ function copyConfig(config: TenantConfig): TenantConfig {
   return {
     businessName: config.businessName,
     segment: config.segment,
+    assistantObjective: typeof config.assistantObjective === "string" ? config.assistantObjective.trim().slice(0, 1000) : "",
     greeting: config.greeting,
     knowledge: (config.knowledge ?? []).map((entry) => ({ ...entry })),
     handoffKeywords: [...(config.handoffKeywords ?? [])],
@@ -210,6 +219,14 @@ function copyConversation(conversation: Conversation): Conversation {
 
 function copyMessage(message: Message): Message {
   return { ...message };
+}
+
+function copyBotSession(session: BotConversationSession): BotConversationSession {
+  return { ...session };
+}
+
+function botSessionKey(tenantId: string, customerPhone: string): string {
+  return `${tenantId}:${customerPhone}`;
 }
 
 function normalizeForMatching(text: string): string {
@@ -255,6 +272,13 @@ function isGreeting(text: string): boolean {
   return /^(oi|ola|bom dia|boa tarde|boa noite)$/.test(normalized);
 }
 
+function canRebuildOrderFromCurrentCatalog(order: CustomerOrder, catalog: readonly CatalogItem[]): boolean {
+  return order.lines.length > 0 && order.lines.every((line) => {
+    const item = catalog.find((candidate) => candidate.id === line.itemId);
+    return Boolean(item && quoteLine(item, line.quantity, line.choices.map((choice) => choice.choiceId)).ok);
+  });
+}
+
 function isTextMessage(type: InboundMessageType, text: string | undefined): text is string {
   return (type === "text" || type === "interactive" || type === "button") && Boolean(text?.trim());
 }
@@ -278,6 +302,7 @@ export class LocalAttendanceService {
   private readonly now: () => Date;
   private readonly createId: () => string;
   private readonly workerIntervalMs: number;
+  private readonly botSessionTtlMs: number;
   private readonly repository: AttendanceStateRepository | undefined;
   private readonly knowledgeAnswerSelector: KnowledgeAnswerSelector | undefined;
   private readonly llmAssistant: LlmAssistant | undefined;
@@ -287,6 +312,7 @@ export class LocalAttendanceService {
   private readonly onOutboundMessage: ((event: OutboundMessageNotice) => void) | undefined;
   private readonly outbox = new Map<string, OutboxEntry>();
   private readonly orders = new Map<string, CustomerOrder>();
+  private readonly botSessions = new Map<string, BotConversationSession>();
   private readonly changeListeners = new Map<string, Set<() => void>>();
   private workerTimer: ReturnType<typeof setInterval> | undefined;
   private pendingRun: Promise<void> | undefined;
@@ -299,6 +325,10 @@ export class LocalAttendanceService {
     this.now = options.now ?? (() => new Date());
     this.createId = options.createId ?? randomUUID;
     this.workerIntervalMs = options.workerIntervalMs ?? 250;
+    this.botSessionTtlMs = options.botSessionTtlMs ?? defaultBotSessionTtlMs;
+    if (!Number.isSafeInteger(this.botSessionTtlMs) || this.botSessionTtlMs < 1) {
+      throw new Error("A expiração da sessão do bot deve ser um número positivo de milissegundos.");
+    }
     this.repository = options.repository;
     this.knowledgeAnswerSelector = options.knowledgeAnswerSelector;
     this.llmAssistant = options.llmAssistant;
@@ -319,6 +349,9 @@ export class LocalAttendanceService {
     const snapshot = this.repository?.load();
     if (snapshot) {
       this.restoreSnapshot(snapshot);
+      if ((snapshot.botSessions?.length ?? 0) !== this.botSessions.size) {
+        this.repository?.save(this.createSnapshot());
+      }
       this.recoverInterruptedOutbound();
       return;
     }
@@ -327,6 +360,7 @@ export class LocalAttendanceService {
       this.insertTenant(demo.tenant, {
         businessName: demo.tenant.displayName,
         segment: demo.tenant.segment,
+        assistantObjective: "",
         greeting: demo.greeting,
         knowledge: demo.knowledge,
         handoffKeywords: [...defaultHandoffKeywords],
@@ -376,6 +410,7 @@ export class LocalAttendanceService {
       const config: TenantConfig = {
         businessName: input.displayName,
         segment: input.segment,
+        assistantObjective: "",
         greeting: `Olá! Sou o assistente virtual de ${input.displayName}. Como posso ajudar?`,
         knowledge: [],
         handoffKeywords: [...defaultHandoffKeywords],
@@ -438,6 +473,12 @@ export class LocalAttendanceService {
     }
 
     return this.mutateTenantState(tenantId, () => {
+      const assistantObjective = input.assistantObjective === undefined
+        ? record.config.assistantObjective
+        : input.assistantObjective.trim();
+      if (assistantObjective.length > 1000) {
+        throw new AttendanceError(400, "invalid_assistant_objective", "O objetivo do bot deve ter no máximo 1000 caracteres.");
+      }
       record.tenant.displayName = input.businessName;
       record.tenant.segment = input.segment;
       let llm: TenantConfig["llm"];
@@ -480,6 +521,7 @@ export class LocalAttendanceService {
       record.config = {
         businessName: input.businessName,
         segment: input.segment,
+        assistantObjective,
         greeting: input.greeting,
         knowledge: input.knowledge.map((entry) => ({ ...entry })),
         handoffKeywords: [...input.handoffKeywords],
@@ -542,7 +584,8 @@ export class LocalAttendanceService {
         throw new AttendanceError(404, "order_not_found", "Pedido não encontrado.");
       }
       const allowed = status === "cancelled"
-        ? current.status === "draft" || current.status === "awaiting_confirmation" || current.status === "confirmed"
+        ? current.status === "draft" || current.status === "awaiting_confirmation" ||
+          current.status === "confirmed" || current.status === "sent_to_integration"
         : current.status === "confirmed";
       if (!allowed) {
         throw new AttendanceError(409, "invalid_order_status", "Esta mudança de status não é permitida.");
@@ -596,6 +639,7 @@ export class LocalAttendanceService {
       conversation.assignedUserId = null;
       conversation.waitingSince = this.now().toISOString();
       conversation.updatedAt = this.now().toISOString();
+      this.clearBotSessionForConversation(conversationId);
       return copyConversation(conversation);
     });
   }
@@ -612,6 +656,7 @@ export class LocalAttendanceService {
       conversation.assignedUserId = userId;
       conversation.waitingSince = null;
       conversation.updatedAt = this.now().toISOString();
+      this.clearBotSessionForConversation(conversationId);
       return copyConversation(conversation);
     });
   }
@@ -652,6 +697,7 @@ export class LocalAttendanceService {
       conversation.assignedUserId = null;
       conversation.waitingSince = null;
       conversation.updatedAt = this.now().toISOString();
+      this.clearBotSessionForConversation(conversationId);
       return copyConversation(conversation);
     });
   }
@@ -667,6 +713,7 @@ export class LocalAttendanceService {
       conversation.assignedUserId = null;
       conversation.waitingSince = null;
       conversation.updatedAt = this.now().toISOString();
+      this.clearBotSessionForConversation(conversationId);
       return copyConversation(conversation);
     });
   }
@@ -714,6 +761,7 @@ export class LocalAttendanceService {
   }
 
   private async drainPending(): Promise<void> {
+    this.expireBotSessions();
     while (true) {
       const event = await this.store.takePending();
       if (!event) return;
@@ -922,22 +970,67 @@ export class LocalAttendanceService {
     const textMessage = isTextMessage(event.type, event.text);
     const existingId = this.conversationKeys.get(`${tenantId}:${customerPhone}`);
     const existing = existingId ? this.conversations.get(existingId) : undefined;
+    const sessionKey = botSessionKey(tenantId, customerPhone);
+    const receivedAt = this.now();
+    const storedSession = this.botSessions.get(sessionKey);
+    const storedLastActivity = storedSession ? Date.parse(storedSession.lastActivityAt) : Number.NaN;
+    const sessionExpired = Boolean(storedSession) && (
+      !Number.isFinite(storedLastActivity) || storedLastActivity > receivedAt.getTime() ||
+      receivedAt.getTime() - storedLastActivity >= this.botSessionTtlMs
+    );
+    const canUseBot = !existing || existing.state === "BOT_ACTIVE" || existing.state === "CLOSED";
+    const reusableSession = storedSession && !sessionExpired && existing?.state === "BOT_ACTIVE"
+      ? copyBotSession(storedSession)
+      : undefined;
+    const sessionToInvalidate = storedSession && !reusableSession ? copyBotSession(storedSession) : undefined;
+    const plannedConversationId = existing?.id ?? this.createId();
+    const botSession: BotConversationSession | undefined = canUseBot
+      ? reusableSession ?? {
+          id: this.createId(),
+          tenantId,
+          customerPhone,
+          conversationId: plannedConversationId,
+          startedAt: receivedAt.toISOString(),
+          lastActivityAt: receivedAt.toISOString(),
+          activeOrderId: null
+        }
+      : undefined;
+    const openOrder = this.openOrderForSession(botSession);
+    if (botSession && botSession.activeOrderId && !openOrder) botSession.activeOrderId = null;
     const scheduling = textMessage && isSchedulingOrQuote(text);
     const orderIntent = textMessage && (isOrderIntent(text) || textMentionsItem(text, record.config.catalog));
+    const historicalOrderRequested = textMessage && isHistoricalOrderInquiry(text);
+    const historicalOrderRepeatRequested = textMessage && isHistoricalOrderRepeatRequest(text);
+    const historicalOrder = historicalOrderRequested && existing
+      ? this.latestHistoricalOrder(existing.id)
+      : undefined;
+    const greetingText = textMessage && isGreeting(text) ? record.config.greeting : undefined;
     const orderingActive = record.config.orderingEnabled && record.config.catalog.some((item) => item.available);
-    const openOrder = existing ? this.openOrder(existing.id) : undefined;
-    const routeToOrdering = Boolean(this.llmAssistant) && orderingActive && !scheduling && (orderIntent || Boolean(openOrder));
+    const historicalOrderRepeatCanStart = historicalOrderRepeatRequested && Boolean(historicalOrder) &&
+      !openOrder && orderingActive && canRebuildOrderFromCurrentCatalog(historicalOrder!, record.config.catalog);
+    const historicalOrderResponse = historicalOrderRequested && !historicalOrder
+      ? "Não encontrei um pedido concluído anteriormente para consultar nesta conversa."
+      : historicalOrderRepeatRequested && openOrder
+        ? "Você já tem um pedido em montagem nesta conversa. Para não misturar os itens, conclua ou encerre esse rascunho antes de criar outro com base no pedido anterior."
+        : historicalOrderRepeatRequested && !orderingActive
+          ? "A montagem de pedidos não está disponível para esta empresa no momento."
+          : historicalOrderRepeatRequested && !historicalOrderRepeatCanStart
+            ? "Algum item ou opção do pedido anterior não está disponível no cardápio atual. Posso ajudar a montar outro pedido?"
+            : undefined;
+    const routeToOrdering = Boolean(this.llmAssistant) && orderingActive && !scheduling && !greetingText &&
+      (!historicalOrderRequested || historicalOrderRepeatCanStart) && (orderIntent || Boolean(openOrder) || historicalOrderRepeatCanStart);
     const initiallyHandled =
       !textMessage ||
       containsHandoffKeyword(text, record.config.handoffKeywords) ||
       scheduling ||
-      (orderIntent && !routeToOrdering);
-    const canUseBot = !existing || existing.state === "BOT_ACTIVE" || existing.state === "CLOSED";
-    const exactAnswer = textMessage && !routeToOrdering ? approvedAnswer(text, record.config.knowledge) : undefined;
-    const greeting = textMessage && !routeToOrdering && isGreeting(text) ? record.config.greeting : undefined;
+      (orderIntent && !routeToOrdering && !historicalOrderRequested);
+    const exactAnswer = textMessage && !routeToOrdering && !historicalOrderRequested
+      ? approvedAnswer(text, record.config.knowledge)
+      : undefined;
+    const greeting = greetingText;
     let selectedKnowledge: KnowledgeEntry | undefined;
     const selectorEligible =
-      canUseBot && !routeToOrdering && !initiallyHandled && !exactAnswer && !greeting &&
+      canUseBot && !routeToOrdering && !historicalOrderRequested && !initiallyHandled && !exactAnswer && !greeting &&
       record.config.assistantMode === "local_ai" && this.knowledgeAnswerSelector && record.config.knowledge.length > 0;
     if (selectorEligible && this.knowledgeAnswerSelector) {
       const knowledgeSnapshot = record.config.knowledge.map((entry) => ({ ...entry }));
@@ -957,12 +1050,11 @@ export class LocalAttendanceService {
     }
     let llmOutcome: LlmTurnOutcome | undefined;
     let producedOrder: CustomerOrder | null = null;
-    let plannedConversationId: string | undefined;
-    if (canUseBot && !initiallyHandled && !exactAnswer && !greeting && !selectorEligible && this.llmAssistant) {
+    if (canUseBot && !initiallyHandled && !exactAnswer && !greeting && !selectorEligible &&
+      !historicalOrderResponse && this.llmAssistant) {
       const knowledgeSnapshot = record.config.knowledge.map((entry) => ({ ...entry }));
       const override = copyTenantLlmOverride(record.config.llm);
-      plannedConversationId = existing?.id ?? this.createId();
-      const session = orderingActive
+      const orderSession = routeToOrdering
         ? new OrderSession({
             tenantId,
             conversationId: plannedConversationId,
@@ -978,25 +1070,57 @@ export class LocalAttendanceService {
           })
         : undefined;
       try {
+        if (historicalOrderRepeatCanStart && historicalOrder && orderSession) {
+          for (const line of historicalOrder.lines) {
+            const result = await orderSession.execute("add_item", {
+              itemId: line.itemId,
+              quantity: line.quantity,
+              choiceIds: line.choices.map((choice) => choice.choiceId)
+            });
+            if (!result.ok) throw new Error(result.message);
+          }
+        }
         llmOutcome = await this.llmAssistant.completeTurn({
           businessName: record.config.businessName,
           segment: record.config.segment,
+          assistantObjective: record.config.assistantObjective,
           customerText: text,
+          history: botSession ? this.historyForBotSession(botSession) : [],
           knowledge: knowledgeSnapshot,
           profile: copyProfile(record.config.profile),
           catalog: copyCatalog(record.config.catalog),
           orderingEnabled: orderingActive,
-          order: openOrder ? copyOrder(openOrder) : null,
-          ...(session ? { session } : {}),
+          order: routeToOrdering && (openOrder || historicalOrderRepeatCanStart)
+            ? copyOrder(orderSession?.order() ?? openOrder!)
+            : null,
+          ...(historicalOrderRequested ? { historicalOrderRequested: true } : {}),
+          ...(historicalOrderRequested ? { historicalOrderMode: historicalOrderRepeatCanStart ? "repeat" : "read_only" } : {}),
+          ...(historicalOrder ? { historicalOrder: copyOrder(historicalOrder) } : {}),
+          ...(orderSession ? { session: orderSession } : {}),
           ...(override ? { override } : {})
         });
-        producedOrder = session?.order() ?? null;
+        producedOrder = orderSession?.order() ?? null;
+        if (producedOrder?.status === "awaiting_confirmation") {
+          if (llmOutcome.kind === "reply") {
+            // O total e o resumo são calculados no servidor, não pelo modelo.
+            llmOutcome = { kind: "reply", text: summarizeOrder(producedOrder) };
+          } else {
+            // Não deixe um resumo apenas interno habilitar confirmação em outro turno.
+            producedOrder.status = "draft";
+            producedOrder.summaryPresentedAt = null;
+          }
+        }
       } catch {
         llmOutcome = this.llmFailureOutcome();
       }
     }
     this.mutateTenantState(tenantId, () => {
       if (this.processedInboundIds.has(dedupeKey)) return;
+
+      if (sessionToInvalidate && this.botSessions.get(sessionKey)?.id === sessionToInvalidate.id) {
+        // Expirar encerra apenas o contexto. O pedido continua no histórico operacional.
+        this.botSessions.delete(sessionKey);
+      }
 
       const currentRecord = this.getTenantRecord(tenantId);
       const conversationKey = `${tenantId}:${customerPhone}`;
@@ -1005,7 +1129,7 @@ export class LocalAttendanceService {
       const now = this.now().toISOString();
 
       if (!conversation) {
-        conversationId = plannedConversationId ?? this.createId();
+        conversationId = plannedConversationId;
         conversation = {
           id: conversationId,
           tenantId,
@@ -1039,7 +1163,8 @@ export class LocalAttendanceService {
         text: messageText,
         createdAt: Number.isFinite(event.occurredAt.getTime()) ? event.occurredAt.toISOString() : now,
         deliveryStatus: "RECEIVED",
-        authorName: event.consumerProfileName?.trim() || null
+        authorName: event.consumerProfileName?.trim() || null,
+        ...(botSession ? { botSessionId: botSession.id } : {})
       };
       this.pushMessage(customerMessage);
       conversation.lastInboundMessageId = customerMessage.id;
@@ -1059,17 +1184,19 @@ export class LocalAttendanceService {
 
       if (conversation.state === "BOT_ACTIVE") {
         const currentOrdering = currentRecord.config.orderingEnabled && currentRecord.config.catalog.some((item) => item.available);
-        const currentRoute = Boolean(this.llmAssistant) && currentOrdering && !scheduling && (orderIntent || Boolean(openOrder));
+        const currentRoute = Boolean(this.llmAssistant) && currentOrdering && !scheduling && !greeting &&
+          !historicalOrderRequested && (orderIntent || Boolean(openOrder));
         const shouldHandoff =
           !textMessage ||
           containsHandoffKeyword(text, currentRecord.config.handoffKeywords) ||
           scheduling ||
-          (orderIntent && !currentRoute);
+          (orderIntent && !currentRoute && !historicalOrderRequested);
         if (shouldHandoff) {
           this.transition(conversation, "WAITING_HUMAN");
           conversation.waitingSince = now;
+          this.clearBotSessionForConversation(conversation.id);
         } else {
-          const answer = approvedAnswer(text, currentRecord.config.knowledge);
+          const answer = historicalOrderRequested ? undefined : approvedAnswer(text, currentRecord.config.knowledge);
           const safeSelectedAnswer = currentRecord.config.assistantMode === "local_ai" && selectedKnowledge
             ? currentRecord.config.knowledge.find((entry) =>
                 entry.question === selectedKnowledge?.question && entry.answer === selectedKnowledge.answer
@@ -1077,25 +1204,52 @@ export class LocalAttendanceService {
             : undefined;
           const response = routeToOrdering
             ? undefined
-            : answer ?? (isGreeting(text) ? currentRecord.config.greeting : undefined) ?? safeSelectedAnswer;
+            : historicalOrderResponse ?? answer ?? (isGreeting(text) ? currentRecord.config.greeting : undefined) ?? safeSelectedAnswer;
           if (producedOrder) this.orders.set(producedOrder.id, producedOrder);
           if (response) {
-            this.appendBotReply(conversation, response, now);
+            this.appendBotReply(conversation, response, now, botSession?.id);
           } else if (!selectorEligible && llmOutcome?.kind === "reply") {
-            this.appendBotReply(conversation, llmOutcome.text, now);
+            this.appendBotReply(conversation, llmOutcome.text, now, botSession?.id);
           } else if (!selectorEligible && llmOutcome?.kind === "reply_and_handoff") {
-            this.appendBotReply(conversation, llmOutcome.text, now);
+            this.appendBotReply(conversation, llmOutcome.text, now, botSession?.id);
             this.transition(conversation, "WAITING_HUMAN");
             conversation.waitingSince = now;
+            this.clearBotSessionForConversation(conversation.id);
           } else if (!selectorEligible && llmOutcome?.kind === "handoff") {
-            if (llmOutcome.text) this.appendBotReply(conversation, llmOutcome.text, now);
+            if (llmOutcome.text) this.appendBotReply(conversation, llmOutcome.text, now, botSession?.id);
             this.transition(conversation, "WAITING_HUMAN");
             conversation.waitingSince = now;
+            this.clearBotSessionForConversation(conversation.id);
           } else {
             this.transition(conversation, "WAITING_HUMAN");
             conversation.waitingSince = now;
+            this.clearBotSessionForConversation(conversation.id);
           }
         }
+      }
+
+      if (botSession && conversation.state === "BOT_ACTIVE") {
+        const currentSession = this.botSessions.get(sessionKey);
+        const maySaveSession = reusableSession
+          ? currentSession?.id === reusableSession.id
+          : !currentSession;
+        if (maySaveSession) {
+          const updatedSession = copyBotSession(botSession);
+          updatedSession.conversationId = conversation.id;
+          updatedSession.lastActivityAt = now;
+          if (producedOrder) {
+            if (producedOrder.status === "draft" || producedOrder.status === "awaiting_confirmation") {
+              this.orders.set(producedOrder.id, producedOrder);
+              updatedSession.activeOrderId = producedOrder.id;
+            } else {
+              this.orders.set(producedOrder.id, producedOrder);
+              updatedSession.activeOrderId = null;
+            }
+          }
+          this.botSessions.set(sessionKey, updatedSession);
+        }
+      } else if (conversation.state !== "BOT_ACTIVE") {
+        this.clearBotSessionForConversation(conversation.id);
       }
 
       // A mensagem só se torna deduplicada depois que todos os efeitos estão prontos.
@@ -1144,6 +1298,7 @@ export class LocalAttendanceService {
       messages: [...this.messages.values()].flatMap((items) => items.map(copyMessage)),
       outbox: [...this.outbox.values()].map((entry) => ({ ...entry })),
       orders: [...this.orders.values()].map(copyOrder),
+      botSessions: [...this.botSessions.values()].map(copyBotSession),
       processedInboundIds: [...this.processedInboundIds]
     };
   }
@@ -1243,6 +1398,31 @@ export class LocalAttendanceService {
       orders.set(order.id, order);
     }
 
+    const botSessions = new Map<string, BotConversationSession>();
+    const sessionIds = new Set<string>();
+    const restoreTime = this.now().getTime();
+    for (const item of snapshot.botSessions ?? []) {
+      const session = copyBotSession(item);
+      const conversation = conversations.get(session.conversationId);
+      const key = botSessionKey(session.tenantId, session.customerPhone);
+      const startedAt = Date.parse(session.startedAt);
+      const lastActivityAt = Date.parse(session.lastActivityAt);
+      if (
+        !session.id || sessionIds.has(session.id) || botSessions.has(key) || !conversation ||
+        conversation.tenantId !== session.tenantId || conversation.customerPhone !== session.customerPhone ||
+        conversation.state !== "BOT_ACTIVE" || !Number.isFinite(startedAt) || !Number.isFinite(lastActivityAt) ||
+        !Number.isFinite(restoreTime) || startedAt > restoreTime || lastActivityAt > restoreTime ||
+        restoreTime - lastActivityAt >= this.botSessionTtlMs
+      ) continue;
+      const linkedOrder = session.activeOrderId ? orders.get(session.activeOrderId) : undefined;
+      if (!linkedOrder || linkedOrder.conversationId !== conversation.id ||
+        (linkedOrder.status !== "draft" && linkedOrder.status !== "awaiting_confirmation")) {
+        session.activeOrderId = null;
+      }
+      botSessions.set(key, session);
+      sessionIds.add(session.id);
+    }
+
     this.tenants.clear();
     this.channelTenants.clear();
     this.conversations.clear();
@@ -1250,6 +1430,7 @@ export class LocalAttendanceService {
     this.messages.clear();
     this.outbox.clear();
     this.orders.clear();
+    this.botSessions.clear();
     this.processedInboundIds.clear();
     for (const [id, record] of tenants) this.tenants.set(id, record);
     for (const [channelId, tenantId] of channelTenants) this.channelTenants.set(channelId, tenantId);
@@ -1260,12 +1441,74 @@ export class LocalAttendanceService {
     for (const id of processedInboundIds) this.processedInboundIds.add(id);
     this.orders.clear();
     for (const [id, order] of orders) this.orders.set(id, order);
+    for (const [key, session] of botSessions) this.botSessions.set(key, session);
   }
 
-  private openOrder(conversationId: string): CustomerOrder | undefined {
-    return [...this.orders.values()].find((order) =>
-      order.conversationId === conversationId && (order.status === "draft" || order.status === "awaiting_confirmation")
+  private openOrderForSession(session: BotConversationSession | undefined): CustomerOrder | undefined {
+    if (!session?.activeOrderId) return undefined;
+    const order = this.orders.get(session.activeOrderId);
+    if (!order || order.conversationId !== session.conversationId ||
+      (order.status !== "draft" && order.status !== "awaiting_confirmation")) return undefined;
+    const result = copyOrder(order);
+    if (result.status === "awaiting_confirmation" && !this.wasOrderSummaryDelivered(result, session.id)) {
+      result.status = "draft";
+      result.summaryPresentedAt = null;
+    }
+    return result;
+  }
+
+  private wasOrderSummaryDelivered(order: CustomerOrder, botSessionId: string): boolean {
+    if (!order.summaryPresentedAt) return false;
+    const summaryAt = Date.parse(order.summaryPresentedAt);
+    if (!Number.isFinite(summaryAt)) return false;
+    const expectedSummary = summarizeOrder(order);
+    return (this.messages.get(order.conversationId) ?? []).some((message) =>
+      message.role === "BOT" && message.botSessionId === botSessionId &&
+      (message.deliveryStatus === "SIMULATED" || message.deliveryStatus === "ACCEPTED") &&
+      Date.parse(message.createdAt) >= summaryAt && message.text === expectedSummary
     );
+  }
+
+  private latestHistoricalOrder(conversationId: string): CustomerOrder | undefined {
+    return [...this.orders.values()]
+      .filter((order) => order.conversationId === conversationId &&
+        (order.status === "confirmed" || order.status === "sent_to_integration"))
+      .sort((left, right) => right.updatedAt.localeCompare(left.updatedAt))[0];
+  }
+
+  private historyForBotSession(session: BotConversationSession): Array<{ role: "user" | "assistant"; content: string }> {
+    const recent = (this.messages.get(session.conversationId) ?? [])
+      .filter((message) => message.botSessionId === session.id && (
+        message.role === "CUSTOMER" ||
+        (message.role === "BOT" && (message.deliveryStatus === "SIMULATED" || message.deliveryStatus === "ACCEPTED"))
+      ))
+      .slice(-maxBotSessionMessages);
+    return recent.map((message) => ({
+      role: message.role === "CUSTOMER" ? "user" : "assistant",
+      content: message.text
+    }));
+  }
+
+  private clearBotSessionForConversation(conversationId: string): void {
+    for (const [key, session] of this.botSessions) {
+      if (session.conversationId === conversationId) this.botSessions.delete(key);
+    }
+  }
+
+  private expireBotSessions(): void {
+    const now = this.now().getTime();
+    const expired = [...this.botSessions.entries()].filter(([, session]) => {
+      const lastActivity = Date.parse(session.lastActivityAt);
+      const conversation = this.conversations.get(session.conversationId);
+      return !Number.isFinite(lastActivity) || !Number.isFinite(now) || lastActivity > now || now - lastActivity >= this.botSessionTtlMs ||
+        !conversation || conversation.state !== "BOT_ACTIVE";
+    });
+    if (expired.length === 0) return;
+    this.mutateState(() => {
+      for (const [key, session] of expired) {
+        if (this.botSessions.get(key)?.id === session.id) this.botSessions.delete(key);
+      }
+    });
   }
 
   private insertTenant(tenant: Tenant, config: TenantConfig): void {
@@ -1313,7 +1556,7 @@ export class LocalAttendanceService {
     conversationMessages.push(message);
   }
 
-  private appendBotReply(conversation: Conversation, text: string, now: string): void {
+  private appendBotReply(conversation: Conversation, text: string, now: string, botSessionId?: string): void {
     const botMessage: Message = {
       id: this.createId(),
       conversationId: conversation.id,
@@ -1321,7 +1564,8 @@ export class LocalAttendanceService {
       text,
       createdAt: now,
       deliveryStatus: "SIMULATED",
-      authorName: null
+      authorName: null,
+      ...(botSessionId ? { botSessionId } : {})
     };
     this.pushMessage(botMessage);
     this.createOutboxEntry(conversation, botMessage);

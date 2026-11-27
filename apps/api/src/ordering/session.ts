@@ -61,6 +61,7 @@ function copyOrder(order: CustomerOrder): CustomerOrder {
 export class OrderSession {
   private current: CustomerOrder | null;
   private readonly options: OrderSessionOptions;
+  private summaryPresentedThisTurn = false;
 
   constructor(options: OrderSessionOptions) {
     this.options = options;
@@ -285,12 +286,16 @@ export class OrderSession {
     draft.status = "awaiting_confirmation";
     draft.summaryPresentedAt = this.stamp();
     draft.updatedAt = draft.summaryPresentedAt;
+    this.summaryPresentedThisTurn = true;
     return ok(summarizeOrder(draft), true);
   }
 
   private async confirm(): Promise<ToolResult> {
     if (!this.current || this.current.status !== "awaiting_confirmation") {
       return failure("summary_not_presented", "Mostre o resumo e espere o cliente confirmar antes de fechar o pedido.");
+    }
+    if (this.summaryPresentedThisTurn) {
+      return failure("summary_presented_this_turn", "O resumo foi enviado agora. Espere uma nova mensagem do cliente antes de confirmar.");
     }
     if (!isExplicitOrderConfirmation(this.options.customerText)) {
       return failure("customer_has_not_confirmed", "O cliente ainda não confirmou o resumo. Não feche o pedido.");

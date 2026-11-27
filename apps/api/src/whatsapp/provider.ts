@@ -11,6 +11,7 @@ import {
   type PolicyBucketSnapshot
 } from "./policy.js";
 import { SendQueue } from "./queue.js";
+import { WhatsAppSendObservability, type WhatsAppSendObservabilitySnapshot } from "./send-observability.js";
 import type { AntiBanSettings } from "./settings.js";
 import { mergeAntiBan } from "./settings.js";
 import {
@@ -40,9 +41,12 @@ export interface PolicyProviderOptions {
   store: ChannelStateStore;
   settings: AntiBanSettings;
   defaultProvider: WhatsAppProviderId;
+  testUnlimitedMode?: boolean;
   clock?: Clock;
   onAlert?: (alert: { tenantId: string; status: string; reason: string; at: string }) => void;
 }
+
+const minuteRateLimitReasons = new Set(["rate_minute", "contact_rate_minute"]);
 
 function counts(record: BucketRecord | undefined, nowMs: number): PolicyBucketSnapshot {
   const bucket = record ?? emptyBucket();
@@ -85,6 +89,7 @@ function ensureTenant(draft: ChannelDocument, tenantId: string, provider: WhatsA
 export class PolicyWhatsAppProvider implements WhatsAppProvider {
   readonly id: WhatsAppProviderId;
   private readonly queue = new SendQueue();
+  private readonly observability = new WhatsAppSendObservability();
   private readonly inboundHandlers = new Set<(message: WhatsAppInboundMessage) => void>();
   private readonly statusHandlers = new Set<(status: WhatsAppStatus) => void>();
   private readonly clock: Clock;
@@ -184,6 +189,10 @@ export class PolicyWhatsAppProvider implements WhatsAppProvider {
     };
   }
 
+  sendObservabilitySnapshot(tenantId: string): WhatsAppSendObservabilitySnapshot {
+    return this.observability.snapshot(tenantId, this.clock.now().getTime());
+  }
+
   contactConsent(tenantId: string, phone: string): { known: boolean; optedOut: boolean; optedIn: boolean } {
     const normalized = this.canonicalContact(tenantId, phone);
     if (!normalized) return { known: false, optedOut: false, optedIn: false };
@@ -195,20 +204,21 @@ export class PolicyWhatsAppProvider implements WhatsAppProvider {
   async sendText(tenantId: string, message: WhatsAppOutboundText): Promise<WhatsAppSendOutcome> {
     const contactId = this.canonicalContact(tenantId, message.to);
     const destination = this.outboundDestination(tenantId, contactId, message.replyJid);
-    if (!contactId || !destination) return { ok: false, reason: "invalid_recipient" };
-    const decision = this.authorize(tenantId, { ...message, to: contactId });
-    if (!decision.allow) return { ok: false, reason: decision.reason };
-    return this.queue.enqueue(tenantId, async () => {
+    if (!contactId || !destination) return this.recordImmediateFailure(tenantId, "invalid_recipient");
+    return this.enqueueObserved(tenantId, async (onMinuteWait) => {
+      const decision = await this.authorizeAtNextMinuteIfNeeded(tenantId, { ...message, to: contactId }, onMinuteWait);
+      if (!decision.allow) return { ok: false, reason: decision.reason };
       const transport = this.transport(tenantId);
       const live = transport.status(tenantId);
       if (this.readTenant(tenantId).halted || live.halted) return { ok: false, reason: "halted" };
       if (live.status !== "connected") return { ok: false, reason: "not_connected" };
-      await this.clock.sleep(decision.delayMs);
+      if (decision.delayMs > 0) await this.clock.sleep(decision.delayMs);
       if (this.readTenant(tenantId).halted) return { ok: false, reason: "halted" };
       if (decision.markRead && message.inboundMessageId) {
         await transport.markRead(tenantId, { to: destination, messageId: message.inboundMessageId }).catch(() => undefined);
       }
       let providerMessageId = "sent";
+      let acceptedChunks = 0;
       for (const chunk of decision.chunks) {
         if (decision.sendTyping) {
           await transport.sendPresence(tenantId, destination, "composing").catch(() => undefined);
@@ -216,7 +226,13 @@ export class PolicyWhatsAppProvider implements WhatsAppProvider {
           await transport.sendPresence(tenantId, destination, "paused").catch(() => undefined);
         }
         const result = await transport.sendText(tenantId, { to: destination, text: chunk });
-        if (!result.ok) return { ok: false, reason: result.reason, ...(result.detail ? { detail: result.detail } : {}) };
+        if (!result.ok) return {
+          ok: false,
+          reason: result.reason,
+          ...(result.detail ? { detail: result.detail } : {}),
+          ...(acceptedChunks > 0 ? { acceptedChunks } : {})
+        };
+        acceptedChunks += 1;
         providerMessageId = result.providerMessageId;
       }
       return { ok: true, providerMessageId, chunks: decision.chunks.length };
@@ -226,26 +242,26 @@ export class PolicyWhatsAppProvider implements WhatsAppProvider {
   async sendMedia(tenantId: string, message: WhatsAppOutboundMedia): Promise<WhatsAppSendOutcome> {
     const contactId = this.canonicalContact(tenantId, message.to);
     const destination = this.outboundDestination(tenantId, contactId, undefined);
-    if (!contactId || !destination) return { ok: false, reason: "invalid_recipient" };
+    if (!contactId || !destination) return this.recordImmediateFailure(tenantId, "invalid_recipient");
     const caption = message.caption?.trim() ?? "";
     if (caption && splitOutboundText(caption, this.settingsFor(tenantId).maxMessageChars).length > 1) {
-      return { ok: false, reason: "message_too_long" };
+      return this.recordImmediateFailure(tenantId, "message_too_long");
     }
-    const decision = this.authorize(tenantId, {
-      to: contactId,
-      text: caption,
-      kind: message.kindOfSend,
-      role: message.role,
-      emptyAllowed: caption.length === 0
-    });
-    if (!decision.allow) return { ok: false, reason: decision.reason };
-    if (caption && decision.chunks.length > 1) return { ok: false, reason: "message_too_long" };
-    return this.queue.enqueue(tenantId, async () => {
+    return this.enqueueObserved(tenantId, async (onMinuteWait) => {
+      const decision = await this.authorizeAtNextMinuteIfNeeded(tenantId, {
+        to: contactId,
+        text: caption,
+        kind: message.kindOfSend,
+        role: message.role,
+        emptyAllowed: caption.length === 0
+      }, onMinuteWait);
+      if (!decision.allow) return { ok: false, reason: decision.reason };
+      if (caption && decision.chunks.length > 1) return { ok: false, reason: "message_too_long" };
       const transport = this.transport(tenantId);
       if (this.readTenant(tenantId).halted || transport.status(tenantId).status !== "connected") {
         return { ok: false, reason: this.readTenant(tenantId).halted ? "halted" : "not_connected" };
       }
-      await this.clock.sleep(decision.delayMs);
+      if (decision.delayMs > 0) await this.clock.sleep(decision.delayMs);
       if (decision.sendTyping) {
         await transport.sendPresence(tenantId, destination, "composing").catch(() => undefined);
         await this.clock.sleep(typingDuration(caption || "midia", this.settingsFor(tenantId)));
@@ -466,6 +482,54 @@ export class PolicyWhatsAppProvider implements WhatsAppProvider {
     return this.options.transports[provider];
   }
 
+  private async authorizeAtNextMinuteIfNeeded(
+    tenantId: string,
+    message: WhatsAppOutboundText & { emptyAllowed?: boolean },
+    onMinuteWait: (milliseconds: number) => void
+  ): Promise<ReturnType<typeof evaluateOutbound>> {
+    let totalWaitMs = 0;
+    while (true) {
+      const decision = this.authorize(tenantId, message);
+      if (decision.allow || !minuteRateLimitReasons.has(decision.reason)) {
+        if (totalWaitMs > 0) onMinuteWait(totalWaitMs);
+        return decision;
+      }
+
+      const nowMs = this.clock.now().getTime();
+      const elapsedInMinute = nowMs - windowStart(nowMs, minuteMs);
+      const waitMs = Math.max(1, minuteMs - elapsedInMinute);
+      totalWaitMs += waitMs;
+      await this.clock.sleep(waitMs);
+    }
+  }
+
+  private enqueueObserved(
+    tenantId: string,
+    operation: (onMinuteWait: (milliseconds: number) => void) => Promise<WhatsAppSendOutcome>
+  ): Promise<WhatsAppSendOutcome> {
+    const enqueuedAt = this.clock.now().getTime();
+    const jobId = this.observability.enqueue(tenantId, enqueuedAt);
+    return this.queue.enqueue(tenantId, async () => {
+      const startedAt = this.clock.now().getTime();
+      this.observability.start(tenantId, jobId, startedAt);
+      let minuteLimitWaitMs = 0;
+      try {
+        const outcome = await operation((milliseconds) => { minuteLimitWaitMs += milliseconds; });
+        this.observability.finish(tenantId, this.clock.now().getTime(), outcome, minuteLimitWaitMs);
+        return outcome;
+      } catch (error) {
+        this.observability.finish(tenantId, this.clock.now().getTime(), { ok: false, reason: "send_exception" }, minuteLimitWaitMs);
+        throw error;
+      }
+    });
+  }
+
+  private recordImmediateFailure(tenantId: string, reason: string): WhatsAppSendOutcome {
+    const outcome: WhatsAppSendOutcome = { ok: false, reason };
+    this.observability.finish(tenantId, this.clock.now().getTime(), outcome, 0, false);
+    return outcome;
+  }
+
   private authorize(tenantId: string, message: WhatsAppOutboundText & { emptyAllowed?: boolean }): ReturnType<typeof evaluateOutbound> {
     let decision: ReturnType<typeof evaluateOutbound> = { allow: false, reason: "not_connected" };
     this.options.store.update((draft) => {
@@ -494,7 +558,8 @@ export class PolicyWhatsAppProvider implements WhatsAppProvider {
         contactBucket: counts(draft.buckets[`contact:${tenantId}:${phone}`], now.getTime()),
         recentIdenticalRecipients: recent.size,
         random: () => this.clock.random(),
-        settings
+        settings,
+        ...(this.options.testUnlimitedMode ? { testUnlimitedMode: true } : {})
       });
       if (!decision.allow) return;
       const globalKey = `tenant:${tenantId}`;

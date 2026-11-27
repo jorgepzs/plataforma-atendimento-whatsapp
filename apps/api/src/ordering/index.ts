@@ -1,7 +1,7 @@
 export { assertCatalog, catalogBrief, copyCatalog, copyProfile, emptyProfile, quoteLine, recomputeTotals, searchCatalog, summarizeOrder } from "./catalog.js";
 export { CatalogError } from "./catalog.js";
 export { parseFallbackPlan } from "./fallback.js";
-export { isExplicitOrderConfirmation, isOrderCancellation, isOrderIntent, isSchedulingOrQuote, textMentionsItem } from "./intent.js";
+export { isExplicitOrderConfirmation, isHistoricalOrderInquiry, isHistoricalOrderRepeatRequest, isOrderCancellation, isOrderIntent, isSchedulingOrQuote, textMentionsItem } from "./intent.js";
 export { allowedAmounts, formatCents, mentionsUnknownPrice } from "./money.js";
 export { buildJsonPrompt, buildSystemPrompt } from "./prompt.js";
 export { barbeariaProfile, pizzariaCatalog, pizzariaProfile } from "./seed.js";

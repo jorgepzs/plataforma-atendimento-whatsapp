@@ -92,6 +92,64 @@ async function ask(service: LocalAttendanceService, text: string, phone: string,
 }
 
 describe("LLM gateway in the attendance worker", () => {
+  it("persists and passes the tenant objective to the system prompt", async () => {
+    const { client, requests } = recordingClient(async () => ({
+      ok: true,
+      text: "Posso ajudar com isso.",
+      toolCalls: [],
+      toolsDegraded: false
+    }));
+    let snapshot: AttendanceSnapshot | undefined;
+    const repository: AttendanceStateRepository = {
+      load: () => snapshot,
+      save: (next) => { snapshot = next; }
+    };
+    const { service } = createService(client, settings(), undefined, repository);
+    const objective = "Coletar os dados necessários e preparar um orçamento odontológico.";
+    const updated = service.updateConfig("pizzaria-demo", configUpdate(service, "pizzaria-demo", {
+      assistantObjective: `  ${objective}  `
+    }));
+
+    expect(updated.config.assistantObjective).toBe(objective);
+    expect(snapshot?.tenants.find(({ tenant }) => tenant.id === "pizzaria-demo")?.config.assistantObjective).toBe(objective);
+    const updatedWithoutObjective = service.updateConfig("pizzaria-demo", configUpdate(service, "pizzaria-demo", {
+      greeting: "Olá, posso ajudar?"
+    }));
+    expect(updatedWithoutObjective.config.assistantObjective).toBe(objective);
+    await ask(service, "Preciso de ajuda com uma informação específica.", "5511991000990");
+    expect(requests[0]?.messages[0]?.content).toContain(objective);
+    expect(requests[0]?.messages[0]?.content).toContain("Não invente disponibilidade ou valores");
+
+    expect(() => service.updateConfig("pizzaria-demo", configUpdate(service, "pizzaria-demo", {
+      assistantObjective: "x".repeat(1001)
+    }))).toThrow("O objetivo do bot deve ter no máximo 1000 caracteres.");
+  });
+
+  it("normalizes snapshots saved before the objective field existed", () => {
+    let snapshot: AttendanceSnapshot | undefined;
+    const repository: AttendanceStateRepository = {
+      load: () => snapshot,
+      save: (next) => { snapshot = next; }
+    };
+    const client = recordingClient(async () => ({
+      ok: true,
+      text: "Resposta.",
+      toolCalls: [],
+      toolsDegraded: false
+    })).client;
+    createService(client, settings(), undefined, repository);
+    const legacyConfig = snapshot?.tenants.find(({ tenant }) => tenant.id === "pizzaria-demo")?.config;
+    expect(legacyConfig).toBeDefined();
+    Reflect.deleteProperty(legacyConfig!, "assistantObjective");
+
+    const restored = new LocalAttendanceService(new MemoryInboundEventStore(), {
+      repository,
+      llmAssistant: createLlmAssistant(client, settings()),
+      workerIntervalMs: 60_000
+    });
+    expect(restored.getConfig("pizzaria-demo").config.assistantObjective).toBe("");
+  });
+
   it("answers from the gateway and skips it for FAQ, greetings and human-only requests", async () => {
     const { client, requests } = recordingClient(async () => ({
       ok: true,
@@ -292,11 +350,25 @@ describe("LLM gateway in the attendance worker", () => {
       method: "PUT",
       url: "/api/v1/tenants/pizzaria-demo/config",
       headers,
-      payload: { ...body, llm: { provider: "local", model: "llama3", apiKey: "route-secret" } }
+      payload: {
+        ...body,
+        assistantObjective: "Coletar informações e orientar o cliente sobre os serviços.",
+        llm: { provider: "local", model: "llama3", apiKey: "route-secret" }
+      }
     });
     expect(saved.statusCode).toBe(200);
     expect(JSON.stringify(saved.json())).not.toContain("route-secret");
     expect(saved.json<{ config: { llm?: { model?: string; apiKey?: string } } }>().config.llm).toEqual({ provider: "local", model: "llama3" });
+    expect(saved.json<{ config: { assistantObjective: string } }>().config.assistantObjective)
+      .toBe("Coletar informações e orientar o cliente sobre os serviços.");
+
+    const oversizedObjective = await app.inject({
+      method: "PUT",
+      url: "/api/v1/tenants/pizzaria-demo/config",
+      headers,
+      payload: { ...body, assistantObjective: "x".repeat(1001) }
+    });
+    expect(oversizedObjective.statusCode).toBe(400);
 
     const accepted = await app.inject({
       method: "POST",

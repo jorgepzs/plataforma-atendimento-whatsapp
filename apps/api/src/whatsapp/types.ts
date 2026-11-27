@@ -76,7 +76,7 @@ export interface WhatsAppOutboundMedia {
 
 export type WhatsAppSendOutcome =
   | { ok: true; providerMessageId: string; chunks: number }
-  | { ok: false; reason: string; detail?: string };
+  | { ok: false; reason: string; detail?: string; acceptedChunks?: number };
 
 /**
  * Contrato usado pelo atendimento, pela fila e pelo painel.
