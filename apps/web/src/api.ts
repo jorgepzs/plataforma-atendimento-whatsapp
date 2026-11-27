@@ -143,6 +143,29 @@ export interface Conversation {
   waitingSince: string | null;
 }
 
+export interface WhatsAppUsage {
+  sentToday: number;
+  dailyCap: number;
+  effectiveDailyCap: number;
+  warmupDay: number;
+  warmupDays: number;
+  inWarmup: boolean;
+}
+
+export interface WhatsAppAntiBan {
+  dailyCap?: number;
+  warmupDays?: number;
+  warmupDailyCap?: number;
+}
+
+export interface ContactConsent {
+  available: boolean;
+  phone: string;
+  known: boolean;
+  optedOut: boolean;
+  optedIn: boolean;
+}
+
 export interface Message {
   id: string;
   conversationId: string;

@@ -30,7 +30,7 @@
     "db:status": "node scripts/postgres-local.mjs status",
     "build": "npm run build --prefix apps/api && npm run build --prefix apps/web",
     "typecheck": "npm run typecheck --prefix apps/api && npm run typecheck --prefix apps/web",
-    "test": "npm test --prefix apps/api && npm run test:meta-config",
+    "test": "npm test --prefix apps/api && npm test --prefix apps/web && npm run test:meta-config",
     "check": "npm run typecheck && npm test && npm run build"
   },
   "engines": {

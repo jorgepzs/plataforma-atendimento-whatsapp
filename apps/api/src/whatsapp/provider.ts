@@ -5,6 +5,7 @@ import {
   dayMs,
   evaluateOutbound,
   hourMs,
+  inWarmup,
   minuteMs,
   windowStart,
   type PolicyBucketSnapshot
@@ -153,6 +154,41 @@ export class PolicyWhatsAppProvider implements WhatsAppProvider {
 
   qrDataUrl(tenantId: string): Promise<string | null> {
     return this.transport(tenantId).qrDataUrl(tenantId);
+  }
+
+  /** Leitura do contador do dia e do aquecimento. Não altera a política de envio. */
+  usageSnapshot(tenantId: string): {
+    sentToday: number;
+    dailyCap: number;
+    effectiveDailyCap: number;
+    warmupDay: number;
+    warmupDays: number;
+    inWarmup: boolean;
+  } {
+    const now = this.clock.now();
+    const settings = this.settingsFor(tenantId);
+    const pairedAt = this.status(tenantId).pairedAt;
+    const sentToday = counts(this.options.store.snapshot().buckets[`tenant:${tenantId}`], now.getTime()).day;
+    const warming = inWarmup(pairedAt, now, settings.warmupDays);
+    const pairedMs = pairedAt ? Date.parse(pairedAt) : Number.NaN;
+    const elapsedDay = Number.isFinite(pairedMs) ? Math.floor((now.getTime() - pairedMs) / dayMs) + 1 : 1;
+    const warmupDay = Math.min(settings.warmupDays, Math.max(1, elapsedDay));
+    return {
+      sentToday,
+      dailyCap: settings.dailyCap,
+      effectiveDailyCap: warming ? Math.min(settings.dailyCap, settings.warmupDailyCap) : settings.dailyCap,
+      warmupDay: warming ? warmupDay : settings.warmupDays,
+      warmupDays: settings.warmupDays,
+      inWarmup: warming
+    };
+  }
+
+  contactConsent(tenantId: string, phone: string): { known: boolean; optedOut: boolean; optedIn: boolean } {
+    const normalized = this.canonicalContact(tenantId, phone);
+    if (!normalized) return { known: false, optedOut: false, optedIn: false };
+    const contact = this.options.store.snapshot().contacts[contactKey(tenantId, normalized)];
+    if (!contact) return { known: false, optedOut: false, optedIn: false };
+    return { known: true, optedOut: contact.optedOut, optedIn: contact.optedIn };
   }
 
   async sendText(tenantId: string, message: WhatsAppOutboundText): Promise<WhatsAppSendOutcome> {
