@@ -1,14 +1,13 @@
 import { readdir, readFile } from "node:fs/promises";
 import path from "node:path";
 import { Pool } from "pg";
-import { loadConfig } from "../../config.js";
 
-const config = loadConfig();
-if (!config.databaseUrl) {
+const databaseUrl = process.env.DATABASE_URL?.trim();
+if (!databaseUrl) {
   throw new Error("DATABASE_URL é obrigatória para executar migrações.");
 }
 
-const pool = new Pool({ connectionString: config.databaseUrl, max: 1 });
+const pool = new Pool({ connectionString: databaseUrl, max: 1 });
 const client = await pool.connect();
 
 try {

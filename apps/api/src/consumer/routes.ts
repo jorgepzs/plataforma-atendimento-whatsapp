@@ -21,10 +21,16 @@ import {
   parseConsumerStatusNotification
 } from "./partner-api.js";
 import { buildConsumerOrderDetailsResponse, type ConsumerQueryDetailsContext } from "./query-details.js";
-import { SqliteConsumerRepository, type ConsumerPartnerConfigRecord } from "./repository.js";
+import {
+  SqliteConsumerRepository,
+  type ConsumerPartnerConfigRecord,
+  type ConsumerRepository
+} from "./repository.js";
 
 interface ConsumerRouteOptions {
-  database: SqliteLocalDatabase;
+  database?: SqliteLocalDatabase;
+  repository?: ConsumerRepository;
+  flushPersistence?: () => Promise<void>;
   service: LocalAttendanceService;
   sessions: LocalSessionManager;
   now?: () => Date;
@@ -45,7 +51,7 @@ function equalHash(left: string, right: string): boolean {
   return a.length === b.length && a.length > 0 && timingSafeEqual(a, b);
 }
 
-function authenticateConsumer(request: FastifyRequest, repository: SqliteConsumerRepository): ConsumerPartnerConfigRecord | undefined {
+function authenticateConsumer(request: FastifyRequest, repository: ConsumerRepository): ConsumerPartnerConfigRecord | undefined {
   const value = request.headers.xapikey;
   if (typeof value !== "string" || !/^[A-Za-z0-9_-]{43}$/.test(value)) return undefined;
   const hash = tokenHash(value);
@@ -116,7 +122,12 @@ function detailsContext(config: ConsumerPartnerConfigRecord, value: Omit<Consume
 }
 
 export async function registerConsumerRoutes(app: FastifyInstance, options: ConsumerRouteOptions): Promise<void> {
-  const repository = new SqliteConsumerRepository(options.database);
+  const repository = options.repository ?? (options.database ? new SqliteConsumerRepository(options.database) : undefined);
+  if (!repository) {
+    throw new Error("As rotas Consumer exigem um repositório ou banco de dados configurado.");
+  }
+  const runTx = <T>(operation: () => T): T =>
+    options.database ? options.database.transaction(operation) : operation();
   const now = options.now ?? (() => new Date());
   const newToken = options.createToken ?? (() => randomBytes(32).toString("base64url"));
   const newEventId = options.createEventId ?? (() => randomBytes(18).toString("base64url"));
@@ -149,7 +160,7 @@ export async function registerConsumerRoutes(app: FastifyInstance, options: Cons
       : null;
     const tokenCreatedAt = apiToken ? updatedAt : previous!.tokenCreatedAt;
     const mappings = toPersistedMappings(input);
-    options.database.transaction(() => repository.saveConfig({
+    runTx(() => repository.saveConfig({
       tenantId,
       enabled: input.enabled,
       enabledSince,
@@ -161,6 +172,7 @@ export async function registerConsumerRoutes(app: FastifyInstance, options: Cons
       ...mappings,
       updatedAt
     }, secretHash, tokenCreatedAt));
+    await options.flushPersistence?.();
     const saved = repository.getConfig(tenantId)!;
     return {
       config: publicConsumerConfig(saved),
@@ -181,6 +193,7 @@ export async function registerConsumerRoutes(app: FastifyInstance, options: Cons
     if (!repository.rotateToken(tenantId, tokenHash(apiToken), issuedAt)) {
       throw new LocalHttpError(404, "consumer_config_not_found", "Configuração Consumer não encontrada.");
     }
+    await options.flushPersistence?.();
     return { apiToken, tokenCreatedAt: issuedAt };
   });
 
@@ -197,6 +210,7 @@ export async function registerConsumerRoutes(app: FastifyInstance, options: Cons
     options.service.getOrder(tenantId, params.orderId);
     const context = consumerOrderDetailsContextSchema.parse(request.body);
     repository.saveOrderDetailsContext(tenantId, params.orderId, context, now().toISOString());
+    await options.flushPersistence?.();
     return { saved: true, orderId: params.orderId };
   });
 
@@ -208,12 +222,13 @@ export async function registerConsumerRoutes(app: FastifyInstance, options: Cons
       .filter((order) => (order.status === "confirmed" || order.status === "sent_to_integration") &&
         config.enabledSince !== null && Date.parse(eventTime(order)) >= Date.parse(config.enabledSince));
     const eventIds = new Map<string, string>();
-    options.database.transaction(() => {
+    runTx(() => {
       for (const order of orders) {
         const event = repository.ensureOrderEvent(config.tenantId, order.id, newEventId(), eventTime(order));
         if (event.detailsRequestedAt === null) eventIds.set(order.id, event.eventId);
       }
     });
+    await options.flushPersistence?.();
     const items = orders.flatMap((order) => {
       const eventId = eventIds.get(order.id);
       if (!eventId) return [];
@@ -248,6 +263,7 @@ export async function registerConsumerRoutes(app: FastifyInstance, options: Cons
         toConsumerCatalogMapping(config)
       );
       repository.markOrderDetailsRequested(config.tenantId, orderId, now().toISOString());
+      await options.flushPersistence?.();
       return reply.send(item);
     } catch (error) {
       if (error instanceof ConsumerPartnerMappingError) {
@@ -285,6 +301,7 @@ export async function registerConsumerRoutes(app: FastifyInstance, options: Cons
       return reply.send({ statusCode: 5, reasonPhrase: "Evento ORDER_DETAILS_REQUESTED não localizado para este pedido." });
     }
     repository.markOrderDetailsRequested(config.tenantId, submitted.Id, now().toISOString());
+    await options.flushPersistence?.();
     return reply.send({ statusCode: 0, reasonPhrase: `${submitted.Id} enviado com sucesso.` });
   });
 
@@ -328,7 +345,10 @@ export async function registerConsumerRoutes(app: FastifyInstance, options: Cons
       status,
       notification.justification ?? null
     ])).digest("hex");
-    if (repository.hasStatusCallback(config.tenantId, callbackHash)) return reply.send(consumerStatusAck());
+    if (repository.hasStatusCallback(config.tenantId, callbackHash)) {
+      await options.flushPersistence?.();
+      return reply.send(consumerStatusAck());
+    }
 
     if (status === "Confirmed") {
       if (order.status === "confirmed") options.service.updateOrderStatus(config.tenantId, order.id, "sent_to_integration");
@@ -354,6 +374,7 @@ export async function registerConsumerRoutes(app: FastifyInstance, options: Cons
       notification.justification,
       now().toISOString()
     );
+    await options.flushPersistence?.();
     return reply.send(consumerStatusAck(
       status === "ReadyToPickup" || status === "Dispatched" || status === "CONCLUDED"
         ? "Status recebido e registrado; não há estado equivalente no domínio local."

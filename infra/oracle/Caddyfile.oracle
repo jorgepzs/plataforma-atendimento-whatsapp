@@ -1,0 +1,85 @@
+# ==============================================================================
+# Caddyfile - Oracle Cloud Always Free Tier (HTTPS automatico via Let's Encrypt)
+# Instalado em: /etc/caddy/Caddyfile
+# Dominio configurado em: /etc/caddy/caddy.env (APP_DOMAIN=atende.seu-dominio.com)
+#
+# Para evitar custos (R$ 0/mes), o Caddy substitui o OCI Load Balancer e faz:
+#  - Terminacao TLS automatica (Let's Encrypt / ZeroSSL)
+#  - Servico estatico do painel React/Vite (apps/web/dist)
+#  - Reverse proxy para a API Node em 127.0.0.1:3000 (com suporte a SSE e WebSocket)
+# ==============================================================================
+
+{$APP_DOMAIN::80} {
+  encode zstd gzip
+
+  # Cabecalhos basicos de seguranca sem quebrar o painel SPA
+  header {
+    X-Content-Type-Options "nosniff"
+    X-Frame-Options "DENY"
+    Referrer-Policy "strict-origin-when-cross-origin"
+    Permissions-Policy "camera=(), microphone=(), geolocation=()"
+    -Server
+  }
+
+  # Rotas da API (inclui autenticacao, atendimento, WhatsApp e SSE em tempo real)
+  # flush_interval -1 garante entrega imediata de eventos Server-Sent Events (SSE) sem buffer.
+  # WebSocket Upgrade e repassado automaticamente pelo reverse_proxy do Caddy v2.
+  handle /api/* {
+    reverse_proxy 127.0.0.1:3000 {
+      flush_interval -1
+      header_up X-Real-IP {remote_host}
+    }
+  }
+
+  # Health checks da API (/health/live e /health/ready)
+  handle /health/* {
+    reverse_proxy 127.0.0.1:3000 {
+      header_up X-Real-IP {remote_host}
+    }
+  }
+
+  # Webhooks externos (ex.: Meta WhatsApp Cloud API)
+  handle /webhooks/* {
+    reverse_proxy 127.0.0.1:3000 {
+      header_up X-Real-IP {remote_host}
+    }
+  }
+
+  # Painel web (SPA estatica gerada em apps/web/dist)
+  handle {
+    root * /opt/plataforma-atendimento/apps/web/dist
+
+    @immutable_assets path /assets/*
+    header @immutable_assets Cache-Control "public, max-age=31536000, immutable"
+
+    @index_html path / /index.html
+    header @index_html Cache-Control "no-cache"
+
+    try_files {path} /index.html
+    file_server
+  }
+}
+
+# ==============================================================================
+# ALTERNATIVA ZERO PORTAS ABERTAS: Cloudflare Tunnel (Zero Trust Free Tier - R$ 0)
+# ==============================================================================
+# Se preferir NAO abrir portas 80/443 na VCN da Oracle (nem expor o IP da VPS):
+#
+# 1. Execute bootstrap-vps.sh com: --proxy cloudflared
+#    Isso mantem apenas SSH (22) no firewall e configura /etc/caddy/caddy.env com:
+#      APP_DOMAIN=http://127.0.0.1:8080
+#
+# 2. Crie um Tunnel gratuito no painel Cloudflare Zero Trust -> Networks -> Tunnels
+#    e instale o servico na VPS com o token fornecido pela Cloudflare:
+#      sudo cloudflared service install <SEU_TUNNEL_TOKEN>
+#
+# 3. No Cloudflare Tunnel, adicione uma Public Hostname:
+#      - Para publicar painel + API + webhooks (somente apos hardening de auth):
+#          Hostname: atende.seu-dominio.com  ->  Service: http://127.0.0.1:8080
+#      - Para demonstracao privada (painel apenas via SSH tunnel, webhook publico):
+#          Hostname: webhook.seu-dominio.com ->  Path: /webhooks/* -> http://127.0.0.1:3000
+#          (mantenha o catch-all final retornando HTTP 404)
+#
+# 4. Lembre-se de cadastrar a origem publica em /etc/plataforma-atendimento/api.env:
+#      WHATSAPP_PANEL_ORIGINS=https://atende.seu-dominio.com
+# ==============================================================================

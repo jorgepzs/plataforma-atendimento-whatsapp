@@ -133,7 +133,13 @@ function App() {
         onLogout={() => void logout()}
         onSessionExpired={expire}
         onTenantsChanged={() => loadTenants(session)}
-        storageLabel={info?.eventStore === "sqlite" ? "SQLite" : "Memória"}
+        storageLabel={
+          info?.eventStore === "postgres"
+            ? "PostgreSQL"
+            : info?.eventStore === "sqlite"
+              ? "SQLite"
+              : "Memória"
+        }
         channelHint={channelHint(info)}
       />
     );

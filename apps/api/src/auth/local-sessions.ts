@@ -6,6 +6,8 @@ const deriveKey = promisify(scrypt);
 const sessionLifetimeMs = 8 * 60 * 60 * 1_000;
 export const localSessionCookieName = "atende_session";
 export const localDemoPassword = "AtendeLocal123!";
+const demoAccountIds = new Set(["admin-demo", "pizzaria-user", "barbearia-user"]);
+const demoAccountEmails = new Set(["admin@atende.local", "pizzaria@atende.local", "barbearia@atende.local"]);
 
 export type LocalRole = "TENANT_ADMIN" | "ATTENDANT";
 export interface LocalMembership { tenantId: string; role: LocalRole }
@@ -68,6 +70,10 @@ function secureEquals(left: string, right: string): boolean {
   return a.length === b.length && timingSafeEqual(a, b);
 }
 
+function isDemoAccount(user: Pick<LocalUser, "id" | "email">): boolean {
+  return demoAccountIds.has(user.id) || demoAccountEmails.has(user.email.toLowerCase());
+}
+
 export class LocalSessionManager {
   private readonly users = new Map<string, StoredUser>();
   private readonly sessions = new Map<string, StoredSession>();
@@ -76,12 +82,20 @@ export class LocalSessionManager {
   private readonly dummySalt = randomBytes(16);
   private readonly dummyHash = scryptSync(randomBytes(32), this.dummySalt, 64);
   private readonly repository: LocalIdentityRepository | undefined;
+  private readonly allowDemoAccounts: boolean;
 
-  constructor(private readonly now: () => number = Date.now, repository?: LocalIdentityRepository) {
+  constructor(private readonly now: () => number = Date.now, repository?: LocalIdentityRepository, allowDemoAccounts = true) {
     this.repository = repository;
+    this.allowDemoAccounts = allowDemoAccounts;
     const snapshot = repository?.load();
     if (snapshot) {
       this.restore(snapshot);
+      const disabledDemoSessions = [...this.sessions.entries()]
+        .filter(([, session]) => {
+          const user = this.users.get(session.userId);
+          return user !== undefined && !this.allowDemoAccounts && isDemoAccount(user);
+        });
+      for (const [tokenHash] of disabledDemoSessions) this.sessions.delete(tokenHash);
       if (this.sessions.size !== snapshot.sessions.length) this.saveCurrentState();
       return;
     }
@@ -95,7 +109,7 @@ export class LocalSessionManager {
       { id: "barbearia-user", email: "barbearia@atende.local", displayName: "Atendente da barbearia", platformAdmin: false,
         memberships: [{ tenantId: "barbearia-demo", role: "ATTENDANT" }] }
     ];
-    for (const user of demoUsers) {
+    for (const user of this.allowDemoAccounts ? demoUsers : []) {
       const salt = randomBytes(16);
       this.users.set(user.id, { ...user, salt, passwordHash: scryptSync(localDemoPassword, salt, 64) });
     }
@@ -205,7 +219,9 @@ export class LocalSessionManager {
     }
     attempt.count += 1;
     this.loginAttempts.set(ip, attempt);
-    const candidate = [...this.users.values()].find((entry) => entry.email === email.trim().toLowerCase());
+    const candidate = [...this.users.values()].find((entry) =>
+      entry.email === email.trim().toLowerCase() && (this.allowDemoAccounts || !isDemoAccount(entry))
+    );
     const passwordHash = (await deriveKey(password, candidate?.salt ?? this.dummySalt, 64)) as Buffer;
     // Re-read live state after scrypt yields: another synchronous mutation may have run meanwhile.
     const user = candidate ? this.users.get(candidate.id) : undefined;
@@ -252,7 +268,9 @@ export class LocalSessionManager {
       throw new LocalHttpError(401, "unauthenticated", "Entre na sua conta para continuar.");
     }
     const user = this.users.get(session.userId);
-    if (!user) throw new LocalHttpError(401, "unauthenticated", "Sessão inválida.");
+    if (!user || (!this.allowDemoAccounts && isDemoAccount(user))) {
+      throw new LocalHttpError(401, "unauthenticated", "Sessão inválida.");
+    }
     return { user: this.publicUser(user), csrfToken: session.csrfToken, expiresAt: new Date(session.expiresAtMs).toISOString() };
   }
 

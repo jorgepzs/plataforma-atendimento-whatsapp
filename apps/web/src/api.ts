@@ -88,6 +88,8 @@ export interface LlmConfig {
   apiKey?: string | null;
 }
 
+export type AssistantMode = "approved_faq" | "local_ai";
+
 export interface TenantConfig {
   businessName: string;
   segment: Tenant["segment"];
@@ -95,7 +97,7 @@ export interface TenantConfig {
   greeting: string;
   knowledge: KnowledgeItem[];
   handoffKeywords: string[];
-  assistantMode: "approved_faq" | "local_ai";
+  assistantMode: AssistantMode;
   version: number;
   profile: BusinessProfile;
   catalog: CatalogItem[];

@@ -1,5 +1,6 @@
 import { z } from "zod";
-import { llmSettingsFromEnvironment, type LlmSettings } from "./llm/settings.js";
+import { assertHttpBaseUrl, llmSettingsFromEnvironment, type LlmSettings } from "./llm/settings.js";
+import type { RagSettings } from "./rag/types.js";
 import { loadWhatsAppConfig, type WhatsAppChannelConfig } from "./whatsapp/settings.js";
 
 const booleanFromEnvironment = z.preprocess((value) => {
@@ -86,6 +87,26 @@ const environmentSchema = z.object({
   BOT_SESSION_TTL_MINUTES: z.preprocess(
     (value) => (value === "" || value === undefined ? 60 : value),
     z.coerce.number().int().min(1).max(1_440)
+  ),
+  RAG_ENABLED: booleanFromEnvironment.default(true),
+  RAG_EMBEDDING_PROVIDER: z.preprocess(
+    (value) => (value === "" || value === undefined ? "none" : value),
+    z.enum(["none", "openrouter", "local"])
+  ),
+  RAG_EMBEDDING_BASE_URL: optionalEnvironmentString,
+  RAG_EMBEDDING_API_KEY: optionalEnvironmentString,
+  RAG_EMBEDDING_MODEL: optionalEnvironmentString,
+  RAG_TOP_K_CATALOG: z.preprocess(
+    (value) => (value === "" || value === undefined ? 8 : value),
+    z.coerce.number().int().min(1).max(30)
+  ),
+  RAG_TOP_K_KNOWLEDGE: z.preprocess(
+    (value) => (value === "" || value === undefined ? 5 : value),
+    z.coerce.number().int().min(1).max(20)
+  ),
+  RAG_TIMEOUT_MS: z.preprocess(
+    (value) => (value === "" || value === undefined ? 8_000 : value),
+    z.coerce.number().int().min(500).max(60_000)
   )
 });
 
@@ -109,7 +130,18 @@ export interface AppConfig {
   whatsappOutboundAccessToken?: string;
   whatsappOutboundAllowedRecipients: string[];
   llm?: LlmSettings;
+  rag?: RagSettings;
   whatsapp: WhatsAppChannelConfig;
+}
+
+export function defaultRagSettings(): RagSettings {
+  return {
+    enabled: true,
+    embeddingProvider: "none",
+    topKCatalog: 8,
+    topKKnowledge: 5,
+    timeoutMs: 8_000
+  };
 }
 
 export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppConfig {
@@ -127,11 +159,11 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
   if (whatsapp.enabled && !whatsapp.sessionDir) {
     throw new Error("WHATSAPP_SESSION_DIR é obrigatório quando o canal WhatsApp está ligado.");
   }
-  if (whatsapp.enabled && !parsed.LOCAL_SQLITE_PATH) {
-    throw new Error("O canal WhatsApp exige LOCAL_SQLITE_PATH para conversas e sessão.");
+  if (whatsapp.enabled && !parsed.DATABASE_URL && !parsed.LOCAL_SQLITE_PATH) {
+    throw new Error("O canal WhatsApp exige DATABASE_URL (PostgreSQL) ou LOCAL_SQLITE_PATH para conversas e sessão.");
   }
-  if (whatsapp.enabled && parsed.DATABASE_URL) {
-    throw new Error("O canal WhatsApp desta versão usa SQLite e não combina com DATABASE_URL.");
+  if (whatsapp.enabled && parsed.DATABASE_URL && parsed.LOCAL_SQLITE_PATH) {
+    throw new Error("LOCAL_SQLITE_PATH não combina com DATABASE_URL; escolha apenas PostgreSQL ou SQLite.");
   }
 
   if (parsed.LOCAL_SQLITE_PATH && !channelWithoutDemo && (
@@ -197,6 +229,40 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     }
   }
 
+  const embeddingProvider = parsed.RAG_EMBEDDING_PROVIDER;
+  const embeddingBaseUrl =
+    parsed.RAG_EMBEDDING_BASE_URL ??
+    (embeddingProvider === "openrouter"
+      ? "https://openrouter.ai/api/v1"
+      : embeddingProvider === "local"
+        ? "http://127.0.0.1:11434/v1"
+        : undefined);
+  const embeddingModel =
+    parsed.RAG_EMBEDDING_MODEL ??
+    (embeddingProvider === "openrouter"
+      ? "openai/text-embedding-3-small"
+      : embeddingProvider === "local"
+        ? "nomic-embed-text"
+        : undefined);
+  const embeddingApiKey =
+    parsed.RAG_EMBEDDING_API_KEY ??
+    (embeddingProvider === "openrouter" ? parsed.LLM_API_KEY : undefined);
+
+  if (embeddingProvider === "openrouter" && !embeddingApiKey) {
+    throw new Error("RAG_EMBEDDING_API_KEY (ou LLM_API_KEY) é obrigatória quando RAG_EMBEDDING_PROVIDER=openrouter.");
+  }
+
+  const rag: RagSettings = {
+    enabled: parsed.RAG_ENABLED,
+    embeddingProvider,
+    ...(embeddingBaseUrl ? { embeddingBaseUrl: assertHttpBaseUrl(embeddingBaseUrl) } : {}),
+    ...(embeddingApiKey ? { embeddingApiKey } : {}),
+    ...(embeddingModel ? { embeddingModel } : {}),
+    topKCatalog: parsed.RAG_TOP_K_CATALOG,
+    topKKnowledge: parsed.RAG_TOP_K_KNOWLEDGE,
+    timeoutMs: parsed.RAG_TIMEOUT_MS
+  };
+
   return {
     nodeEnv: parsed.NODE_ENV,
     host: parsed.API_HOST,
@@ -217,6 +283,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     ...(parsed.DATABASE_URL ? { databaseUrl: parsed.DATABASE_URL } : {}),
     ...(parsed.META_APP_SECRET ? { metaAppSecret: parsed.META_APP_SECRET } : {}),
     ...(llm ? { llm } : {}),
+    rag,
     whatsapp
   };
 }

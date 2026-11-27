@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { FastifyRequest } from "fastify";
-import { LocalSessionManager, localDemoPassword, localSessionCookieName } from "../src/auth/local-sessions.js";
+import { LocalSessionManager, localDemoPassword, localSessionCookieName, type LocalIdentitySnapshot } from "../src/auth/local-sessions.js";
 
 function request(token: string, headers: Record<string, string> = {}): FastifyRequest {
   return { headers: { cookie: `${localSessionCookieName}=${token}`, ...headers } } as FastifyRequest;
@@ -39,5 +39,25 @@ describe("local session lifecycle", () => {
       await expect(sessions.login("admin@atende.local", "wrong", "guessing-ip")).rejects.toMatchObject({ statusCode: 401, code: "invalid_credentials" });
     }
     await expect(sessions.login("admin@atende.local", localDemoPassword, "guessing-ip")).rejects.toMatchObject({ statusCode: 429 });
+  });
+
+  it("does not seed or accept demo identities in production mode, including restored sessions", async () => {
+    let snapshot: LocalIdentitySnapshot | undefined;
+    const repository = {
+      load: () => snapshot,
+      save: (next: LocalIdentitySnapshot) => { snapshot = structuredClone(next); }
+    };
+    const development = new LocalSessionManager(Date.now, repository);
+    const previousLogin = await development.login("admin@atende.local", localDemoPassword, "127.0.0.1");
+    const production = new LocalSessionManager(Date.now, repository, false);
+
+    await expect(production.login("admin@atende.local", localDemoPassword, "127.0.0.1"))
+      .rejects.toMatchObject({ statusCode: 401, code: "invalid_credentials" });
+    expect(() => production.requireSession(request(previousLogin.token)))
+      .toThrow("Entre na sua conta");
+
+    const emptyProduction = new LocalSessionManager(Date.now, undefined, false);
+    await expect(emptyProduction.login("admin@atende.local", localDemoPassword, "127.0.0.1"))
+      .rejects.toMatchObject({ statusCode: 401, code: "invalid_credentials" });
   });
 });

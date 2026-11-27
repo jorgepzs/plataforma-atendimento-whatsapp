@@ -226,7 +226,7 @@ export async function runSmoke({
   assert((await readJson(proxiedInfo))?.version === "0.1.0", "O proxy do Vite para /api/v1/system/info retornou conteúdo inesperado.");
   console.log("PASS Vite API proxies");
 
-  if (infoBody?.localDemoEnabled) await runAttendanceSmoke(apiUrl);
+  if (infoBody?.localDemoEnabled || infoBody?.attendancePersistence === "postgres") await runAttendanceSmoke(apiUrl);
 }
 
 if (process.argv[1] && resolve(process.argv[1]) === fileURLToPath(import.meta.url)) {

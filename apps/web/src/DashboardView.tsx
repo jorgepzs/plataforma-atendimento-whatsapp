@@ -1,6 +1,14 @@
 import { useEffect, useState } from "react";
 import { Headset, ShoppingBag, Wifi } from "lucide-react";
-import { ApiError, apiRequest, formatApiError, tenantPath, type Conversation, type CustomerOrder, type Session } from "./api";
+import {
+  ApiError,
+  apiRequest,
+  formatApiError,
+  tenantPath,
+  type Conversation,
+  type CustomerOrder,
+  type Session
+} from "./api";
 import { isToday } from "./format";
 import type { WhatsAppChannelView } from "./WhatsAppView";
 import { Badge } from "./ui";

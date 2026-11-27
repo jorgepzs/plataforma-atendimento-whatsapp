@@ -1,4 +1,4 @@
-import { useState, type FormEvent, type ReactNode } from "react";
+import { useState, type KeyboardEvent, type ReactNode } from "react";
 import {
   centsFromTyping,
   defaultWeek,
@@ -263,7 +263,8 @@ export function ChipEditor({
     onChange([...values, next].slice(0, 12));
     setDraft("");
   }
-  function submit(event: FormEvent) {
+  function submitOnEnter(event: KeyboardEvent<HTMLInputElement>) {
+    if (event.key !== "Enter") return;
     event.preventDefault();
     add(draft);
   }
@@ -292,10 +293,20 @@ export function ChipEditor({
           </button>
         ))}
       </div>
-      <form className="inline-field" onSubmit={submit}>
-        <input aria-label={label} value={draft} disabled={disabled} placeholder={placeholder} onChange={(event) => setDraft(event.target.value)} maxLength={40} />
-        <button className="btn secondary sm" type="submit" disabled={disabled || !draft.trim()}>Adicionar</button>
-      </form>
+      <div className="inline-field">
+        <input
+          aria-label={label}
+          value={draft}
+          disabled={disabled}
+          placeholder={placeholder}
+          onChange={(event) => setDraft(event.target.value)}
+          onKeyDown={submitOnEnter}
+          maxLength={40}
+        />
+        <button className="btn secondary sm" type="button" disabled={disabled || !draft.trim()} onClick={() => add(draft)}>
+          Adicionar
+        </button>
+      </div>
     </div>
   );
 }

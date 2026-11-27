@@ -1,12 +1,12 @@
 import type { KnowledgeEntry, TenantSegment } from "../attendance/types.js";
+import { guardAssistantOutput, inspectCustomerInput, validateToolCall } from "../guardrails/index.js";
+import type { RagRetrievedContext } from "../rag/types.js";
 import {
-  allowedAmounts,
   buildJsonPrompt,
   buildSystemPrompt,
   inferPlanFromText,
   isOrderIntent,
   textMentionsItem,
-  mentionsUnknownPrice,
   orderingTools,
   parseFallbackPlan,
   transferTool,
@@ -44,6 +44,7 @@ export interface LlmTurnInput {
   historicalOrder?: CustomerOrder | null;
   session?: OrderSession;
   override?: TenantLlmOverride;
+  rag?: RagRetrievedContext;
 }
 
 export interface LlmAssistant {
@@ -92,46 +93,61 @@ function failureFrom(settings: LlmSettings): LlmTurnOutcome {
   return { kind: "reply_and_handoff", text: settings.failureMessage };
 }
 
-function guardedText(text: string, input: LlmTurnInput, secret?: string): string {
-  const cleaned = sanitizeReply(text, secret);
-  if (!cleaned) return "";
-  const profile = input.profile ?? emptyProfile();
-  const catalog = input.catalog ?? [];
-  if (mentionsUnknownPrice(cleaned, allowedAmounts(catalog, profile, input.session?.order() ?? input.order ?? null))) {
-    return "";
-  }
-  return cleaned;
+function guardedText(
+  text: string,
+  input: LlmTurnInput,
+  secret?: string,
+  confirmedInThisTurn = false
+): string {
+  const result = guardAssistantOutput(text, {
+    catalog: input.catalog ?? [],
+    profile: input.profile ?? emptyProfile(),
+    order: input.session?.order() ?? input.order ?? null,
+    confirmedInThisTurn,
+    secrets: secret ? [secret] : [],
+    maxLength: maxReplyLength
+  });
+  return result.ok ? result.sanitizedText : "";
 }
 
 export function createLlmAssistant(client: LlmChatClient, baseSettings: LlmSettings): LlmAssistant {
   return {
     failureOutcome: () => failureFrom(baseSettings),
     async completeTurn(input) {
-      const customerText = input.customerText.trim();
+      const inputCheck = inspectCustomerInput(input.customerText);
+      if (!inputCheck.allowed) {
+        return { kind: "handoff", text: handoffNotice };
+      }
+      const customerText = inputCheck.sanitizedText;
       if (!customerText || customerText.length > maxCustomerTextLength) return failureFrom(baseSettings);
-      const profile = input.profile ?? emptyProfile();
-      const catalog = input.catalog ?? [];
-      const orderingEnabled = input.orderingEnabled === true && catalog.some((item) => item.available);
+      const safeInput: LlmTurnInput = customerText === input.customerText
+        ? input
+        : { ...input, customerText };
+      const profile = safeInput.profile ?? emptyProfile();
+      const catalog = safeInput.catalog ?? [];
+      const orderingEnabled = safeInput.orderingEnabled === true && catalog.some((item) => item.available);
       const prompt = buildSystemPrompt({
-        businessName: input.businessName,
-        segment: input.segment,
-        ...(input.assistantObjective !== undefined ? { assistantObjective: input.assistantObjective } : {}),
-        knowledge: input.knowledge,
+        businessName: safeInput.businessName,
+        segment: safeInput.segment,
+        ...(safeInput.assistantObjective !== undefined ? { assistantObjective: safeInput.assistantObjective } : {}),
+        knowledge: safeInput.knowledge,
         profile,
         catalog,
         orderingEnabled,
-        order: input.order ?? null,
-        ...(input.historicalOrderRequested !== undefined ? { historicalOrderRequested: input.historicalOrderRequested } : {}),
-        ...(input.historicalOrderMode !== undefined ? { historicalOrderMode: input.historicalOrderMode } : {}),
-        ...(input.historicalOrder ? { historicalOrder: input.historicalOrder } : {})
+        order: safeInput.order ?? null,
+        ...(safeInput.historicalOrderRequested !== undefined ? { historicalOrderRequested: safeInput.historicalOrderRequested } : {}),
+        ...(safeInput.historicalOrderMode !== undefined ? { historicalOrderMode: safeInput.historicalOrderMode } : {}),
+        ...(safeInput.historicalOrder ? { historicalOrder: safeInput.historicalOrder } : {}),
+        ...(safeInput.rag ? { rag: safeInput.rag } : {})
       });
       if (!prompt) return failureFrom(baseSettings);
 
       try {
-        const settings = resolveLlmSettings(baseSettings, input.override);
-        const tools = orderingEnabled && input.session ? orderingTools : [transferTool];
+        const settings = resolveLlmSettings(baseSettings, safeInput.override);
+        const tools = orderingEnabled && safeInput.session ? orderingTools : [transferTool];
+        const allowedToolNames = tools.map((tool) => tool.name);
         const historyBudget = Math.min(maxHistoryCharacters, maxRequestCharacters - prompt.length - customerText.length);
-        const history = boundedHistory(input.history, historyBudget);
+        const history = boundedHistory(safeInput.history, historyBudget);
         const messages: LlmChatMessage[] = [
           { role: "system", content: prompt },
           ...history,
@@ -140,31 +156,49 @@ export function createLlmAssistant(client: LlmChatClient, baseSettings: LlmSetti
         if (!settings.supportsTools) {
           const plain = await client.complete({ settings, messages });
           if (!plain.ok) return failureFrom(baseSettings);
-          return withoutTools(client, settings, input, plain.text);
+          return withoutTools(client, settings, safeInput, plain.text);
         }
 
+        let toolCallCount = 0;
+        let confirmedInThisTurn = false;
         for (let round = 0; round < maxToolRounds; round += 1) {
           const result = await client.complete({ settings, tools, messages });
           if (!result.ok) return failureFrom(baseSettings);
-          if (result.toolsDegraded) return withoutTools(client, settings, input, result.text);
+          if (result.toolsDegraded) return withoutTools(client, settings, safeInput, result.text);
           if (result.toolCalls.some((call) => call.name === transferToolName)) {
             return { kind: "handoff", text: handoffNotice };
           }
-          if (result.toolCalls.length === 0 || !input.session) {
-            const text = guardedText(result.text, input, settings.apiKey);
-            if (!text) return orderingFallback(input) ?? failureFrom(baseSettings);
+          if (result.toolCalls.length === 0 || !safeInput.session) {
+            const text = guardedText(result.text, safeInput, settings.apiKey, confirmedInThisTurn);
+            if (!text) return orderingFallback(safeInput) ?? failureFrom(baseSettings);
             return { kind: "reply", text };
           }
           messages.push({ role: "assistant", content: result.text, toolCalls: result.toolCalls });
           for (const call of result.toolCalls) {
-            const output = await input.session.execute(call.name, call.arguments);
+            const checked = validateToolCall({
+              toolName: call.name,
+              args: call.arguments,
+              allowedTools: allowedToolNames,
+              callCountInTurn: toolCallCount
+            });
+            toolCallCount += 1;
+            if (!checked.ok) {
+              messages.push({
+                role: "tool",
+                toolCallId: call.id,
+                content: JSON.stringify({ ok: false, error: checked.error, message: checked.message, changed: false, handoff: false })
+              });
+              continue;
+            }
+            const output = await safeInput.session.execute(call.name, checked.sanitizedArgs ?? {});
+            if (call.name === "confirm_order" && output.ok) confirmedInThisTurn = true;
             messages.push({ role: "tool", toolCallId: call.id, content: JSON.stringify(output) });
             if (output.handoff) return { kind: "handoff", text: handoffNotice };
           }
         }
-        const summary = input.session?.order();
+        const summary = safeInput.session?.order();
         if (summary && summary.lines.length > 0) {
-          const text = guardedText(summaryText(input), input, settings.apiKey);
+          const text = guardedText(summaryText(safeInput), safeInput, settings.apiKey, confirmedInThisTurn);
           if (text) return { kind: "reply", text };
         }
         return failureFrom(baseSettings);

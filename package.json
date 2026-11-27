@@ -7,6 +7,7 @@
     "dev:api": "npm run dev --prefix apps/api",
     "dev:web": "npm run dev --prefix apps/web",
     "dev:local": "node scripts/dev-local.mjs",
+    "dev:sqlite": "node scripts/dev-local.mjs --sqlite",
     "dev:memory": "node scripts/dev-local.mjs --memory",
     "smoke:local": "node scripts/smoke-local.mjs",
     "test:local": "node scripts/dev-local.mjs --smoke",

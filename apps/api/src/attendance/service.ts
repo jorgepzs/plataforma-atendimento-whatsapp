@@ -27,7 +27,9 @@ import type {
   UpdateTenantConfigInput
 } from "./types.js";
 import type { KnowledgeAnswerSelector } from "./knowledge-classifier.js";
+import { validateAssistantObjective } from "../guardrails/index.js";
 import type { LlmAssistant, LlmTurnOutcome } from "../llm/assistant.js";
+import type { TenantRagService } from "../rag/service.js";
 import { LlmSettingsError, mergeTenantLlmUpdate, presentTenantLlmOverride, copyTenantLlmOverride } from "../llm/settings.js";
 import {
   assertCatalog,
@@ -76,6 +78,7 @@ interface ServiceOptions {
   repository?: AttendanceStateRepository;
   knowledgeAnswerSelector?: KnowledgeAnswerSelector;
   llmAssistant?: LlmAssistant;
+  ragService?: TenantRagService;
   orderSink?: OrderSink;
   outbound?: LocalOutboundOptions;
   onCustomerMessage?: (event: CustomerMessageNotice) => void;
@@ -299,13 +302,14 @@ export class LocalAttendanceService {
   private readonly conversationKeys = new Map<string, string>();
   private readonly messages = new Map<string, Message[]>();
   private readonly processedInboundIds = new Set<string>();
-  private readonly now: () => Date;
-  private readonly createId: () => string;
+  private readonly nowFn: () => Date;
+  private readonly createIdFn: () => string;
   private readonly workerIntervalMs: number;
   private readonly botSessionTtlMs: number;
   private readonly repository: AttendanceStateRepository | undefined;
   private readonly knowledgeAnswerSelector: KnowledgeAnswerSelector | undefined;
   private readonly llmAssistant: LlmAssistant | undefined;
+  private readonly ragService: TenantRagService | undefined;
   private readonly orderSink: OrderSink;
   private readonly outbound: LocalOutboundOptions | undefined;
   private readonly onCustomerMessage: ((event: CustomerMessageNotice) => void) | undefined;
@@ -322,8 +326,8 @@ export class LocalAttendanceService {
     private readonly store: PendingInboundEventStore,
     options: ServiceOptions = {}
   ) {
-    this.now = options.now ?? (() => new Date());
-    this.createId = options.createId ?? randomUUID;
+    this.nowFn = options.now ?? (() => new Date());
+    this.createIdFn = options.createId ?? randomUUID;
     this.workerIntervalMs = options.workerIntervalMs ?? 250;
     this.botSessionTtlMs = options.botSessionTtlMs ?? defaultBotSessionTtlMs;
     if (!Number.isSafeInteger(this.botSessionTtlMs) || this.botSessionTtlMs < 1) {
@@ -332,6 +336,7 @@ export class LocalAttendanceService {
     this.repository = options.repository;
     this.knowledgeAnswerSelector = options.knowledgeAnswerSelector;
     this.llmAssistant = options.llmAssistant;
+    this.ragService = options.ragService;
     this.orderSink = options.orderSink ?? createWebhookOrderSink();
     this.outbound = options.outbound;
     this.onCustomerMessage = options.onCustomerMessage;
@@ -397,7 +402,7 @@ export class LocalAttendanceService {
 
   createTenant(input: CreateTenantInput): Tenant {
     return this.mutateState(() => {
-      const id = this.createId();
+      const id = this.createIdFn();
       const baseSlug = normalizeSlug(input.displayName);
       const slug = `${baseSlug}-${id.slice(0, 8)}`;
       const tenant: Tenant = {
@@ -455,6 +460,11 @@ export class LocalAttendanceService {
     return { tenant: copyTenant(record.tenant), config: presentConfig(record.config) };
   }
 
+  getInternalTenantConfig(tenantId: string): { tenant: Tenant; config: TenantConfig } {
+    const record = this.getTenantRecord(tenantId);
+    return { tenant: copyTenant(record.tenant), config: copyConfig(record.config) };
+  }
+
   reloadFromRepository(): void {
     if (!this.repository) {
       throw new Error("Não é possível recarregar o atendimento sem um repositório persistente.");
@@ -472,12 +482,24 @@ export class LocalAttendanceService {
       throw new AttendanceError(409, "config_version_conflict", "A configuração foi alterada por outra sessão.");
     }
 
-    return this.mutateTenantState(tenantId, () => {
-      const assistantObjective = input.assistantObjective === undefined
+    const updated = this.mutateTenantState(tenantId, () => {
+      const rawObjective = input.assistantObjective === undefined
         ? record.config.assistantObjective
         : input.assistantObjective.trim();
-      if (assistantObjective.length > 1000) {
+      if (rawObjective.length > 1000) {
         throw new AttendanceError(400, "invalid_assistant_objective", "O objetivo do bot deve ter no máximo 1000 caracteres.");
+      }
+      let assistantObjective = rawObjective;
+      if (rawObjective) {
+        const checkedObjective = validateAssistantObjective(rawObjective);
+        if (!checkedObjective.ok) {
+          throw new AttendanceError(
+            400,
+            "invalid_assistant_objective",
+            checkedObjective.reason ?? "O objetivo do bot viola as diretrizes de segurança."
+          );
+        }
+        assistantObjective = checkedObjective.sanitizedObjective;
       }
       record.tenant.displayName = input.businessName;
       record.tenant.segment = input.segment;
@@ -535,6 +557,16 @@ export class LocalAttendanceService {
       };
       return { tenant: copyTenant(record.tenant), config: presentConfig(record.config) };
     });
+
+    try {
+      if (this.ragService?.enabled) {
+        const snapshotConfig = copyConfig(record.config);
+        void this.ragService.syncTenant(tenantId, snapshotConfig).catch(() => undefined);
+      }
+    } catch {
+      // Falhas de indexação RAG nunca desfazem a configuração da empresa.
+    }
+    return updated;
   }
 
   listConversations(tenantId: string, state?: ConversationState): Conversation[] {
@@ -590,7 +622,7 @@ export class LocalAttendanceService {
       if (!allowed) {
         throw new AttendanceError(409, "invalid_order_status", "Esta mudança de status não é permitida.");
       }
-      const now = this.now().toISOString();
+      const now = this.nowFn().toISOString();
       current.status = status;
       current.updatedAt = now;
       if (status === "cancelled") current.cancelledAt = now;
@@ -609,7 +641,7 @@ export class LocalAttendanceService {
 
   async simulateMessage(tenantId: string, input: SimulateMessageInput): Promise<SimulateMessageResult> {
     const record = this.getTenantRecord(tenantId);
-    const clientId = input.clientMessageId ?? this.createId();
+    const clientId = input.clientMessageId ?? this.createIdFn();
     const eventId = `sim:${tenantId}:${clientId}`;
     const event: NormalizedInboundMessage = {
       provider: "META_WHATSAPP",
@@ -618,7 +650,7 @@ export class LocalAttendanceService {
       providerPhoneNumberId: record.tenant.channelPhoneNumberId,
       consumerPhoneNumber: input.customerPhone,
       consumerProfileName: input.customerName,
-      occurredAt: this.now(),
+      occurredAt: this.nowFn(),
       type: "text",
       text: input.text,
       rawMessage: { source: "local-simulator", tenantId, customerName: input.customerName, text: input.text }
@@ -637,8 +669,8 @@ export class LocalAttendanceService {
     return this.mutateTenantState(tenantId, () => {
       this.transition(conversation, "WAITING_HUMAN");
       conversation.assignedUserId = null;
-      conversation.waitingSince = this.now().toISOString();
-      conversation.updatedAt = this.now().toISOString();
+      conversation.waitingSince = this.nowFn().toISOString();
+      conversation.updatedAt = this.nowFn().toISOString();
       this.clearBotSessionForConversation(conversationId);
       return copyConversation(conversation);
     });
@@ -655,7 +687,7 @@ export class LocalAttendanceService {
       this.transition(conversation, "HUMAN_ACTIVE");
       conversation.assignedUserId = userId;
       conversation.waitingSince = null;
-      conversation.updatedAt = this.now().toISOString();
+      conversation.updatedAt = this.nowFn().toISOString();
       this.clearBotSessionForConversation(conversationId);
       return copyConversation(conversation);
     });
@@ -670,9 +702,9 @@ export class LocalAttendanceService {
     const conversation = this.getConversationRecord(tenantId, conversationId);
     this.assertOwner(conversation, user.id);
     return this.mutateTenantState(tenantId, () => {
-      const createdAt = this.now().toISOString();
+      const createdAt = this.nowFn().toISOString();
       const message: Message = {
-        id: this.createId(),
+        id: this.createIdFn(),
         conversationId,
         role: "ATTENDANT",
         text,
@@ -696,7 +728,7 @@ export class LocalAttendanceService {
       this.transition(conversation, "CLOSED");
       conversation.assignedUserId = null;
       conversation.waitingSince = null;
-      conversation.updatedAt = this.now().toISOString();
+      conversation.updatedAt = this.nowFn().toISOString();
       this.clearBotSessionForConversation(conversationId);
       return copyConversation(conversation);
     });
@@ -712,7 +744,7 @@ export class LocalAttendanceService {
       this.transition(conversation, "BOT_ACTIVE");
       conversation.assignedUserId = null;
       conversation.waitingSince = null;
-      conversation.updatedAt = this.now().toISOString();
+      conversation.updatedAt = this.nowFn().toISOString();
       this.clearBotSessionForConversation(conversationId);
       return copyConversation(conversation);
     });
@@ -813,7 +845,7 @@ export class LocalAttendanceService {
         continue;
       }
 
-      const attemptedAt = this.now().toISOString();
+      const attemptedAt = this.nowFn().toISOString();
       this.mutateTenantState(pending.tenantId, () => {
         const entry = this.outbox.get(pending.id);
         if (!entry || entry.status !== "PENDING") return;
@@ -834,7 +866,7 @@ export class LocalAttendanceService {
         result = { status: "INDETERMINATE", reason: "network_error" } as const;
       }
 
-      const completedAt = this.now().toISOString();
+      const completedAt = this.nowFn().toISOString();
       this.mutateTenantState(pending.tenantId, () => {
         const entry = this.outbox.get(pending.id);
         if (!entry || entry.status !== "SENDING") return;
@@ -865,7 +897,7 @@ export class LocalAttendanceService {
       entry.status = status;
       entry.blockedReason = reason;
       entry.resultCode = resultCode;
-      entry.completedAt = this.now().toISOString();
+      entry.completedAt = this.nowFn().toISOString();
       const message = (this.messages.get(entry.conversationId) ?? []).find((item) => item.id === entry.messageId);
       if (message) message.deliveryStatus = status;
     });
@@ -931,7 +963,7 @@ export class LocalAttendanceService {
     if (!this.outbound.allowedRecipients.includes(recipient)) return "recipient_not_allowlisted";
     const timestamp = Date.parse(inboundAt);
     if (!Number.isFinite(timestamp)) return "invalid_inbound_timestamp";
-    const age = this.now().getTime() - timestamp;
+    const age = this.nowFn().getTime() - timestamp;
     if (age < 0) return "future_inbound_timestamp";
     if (age >= outboundServiceWindowMs) return "service_window_expired";
     return null;
@@ -948,7 +980,7 @@ export class LocalAttendanceService {
       if (entry.status !== "SENDING") continue;
       entry.status = "INDETERMINATE";
       entry.resultCode = "process_restarted_during_send";
-      entry.completedAt = this.now().toISOString();
+      entry.completedAt = this.nowFn().toISOString();
       const message = (this.messages.get(entry.conversationId) ?? []).find((item) => item.id === entry.messageId);
       if (message) message.deliveryStatus = "INDETERMINATE";
       recovered = true;
@@ -965,13 +997,32 @@ export class LocalAttendanceService {
 
     const customerPhone = event.consumerPhoneNumber.trim();
     if (!customerPhone) return;
+    await this.processInboundEvents(tenantId, customerPhone, [event]);
+  }
+
+  private async processInboundEvents(
+    tenantId: string,
+    customerPhone: string,
+    rawEvents: readonly NormalizedInboundMessage[],
+    combinedTextOverride?: string
+  ): Promise<void> {
+    const events = rawEvents.filter((item) => {
+      const key = `${tenantId}:${item.provider}:${item.providerEventId}`;
+      return !this.processedInboundIds.has(key);
+    });
+    if (events.length === 0) return;
+
+    const latestEvent = events[events.length - 1]!;
     const record = this.getTenantRecord(tenantId);
-    const text = event.text?.trim() ?? "";
-    const textMessage = isTextMessage(event.type, event.text);
+    const allText = events.every((item) => isTextMessage(item.type, item.text));
+    const text = combinedTextOverride !== undefined
+      ? combinedTextOverride.trim()
+      : events.map((item) => item.text?.trim() ?? "").filter(Boolean).join("\n");
+    const textMessage = allText && Boolean(text);
     const existingId = this.conversationKeys.get(`${tenantId}:${customerPhone}`);
     const existing = existingId ? this.conversations.get(existingId) : undefined;
     const sessionKey = botSessionKey(tenantId, customerPhone);
-    const receivedAt = this.now();
+    const receivedAt = this.nowFn();
     const storedSession = this.botSessions.get(sessionKey);
     const storedLastActivity = storedSession ? Date.parse(storedSession.lastActivityAt) : Number.NaN;
     const sessionExpired = Boolean(storedSession) && (
@@ -983,10 +1034,10 @@ export class LocalAttendanceService {
       ? copyBotSession(storedSession)
       : undefined;
     const sessionToInvalidate = storedSession && !reusableSession ? copyBotSession(storedSession) : undefined;
-    const plannedConversationId = existing?.id ?? this.createId();
+    const plannedConversationId = existing?.id ?? this.createIdFn();
     const botSession: BotConversationSession | undefined = canUseBot
       ? reusableSession ?? {
-          id: this.createId(),
+          id: this.createIdFn(),
           tenantId,
           customerPhone,
           conversationId: plannedConversationId,
@@ -997,7 +1048,13 @@ export class LocalAttendanceService {
       : undefined;
     const openOrder = this.openOrderForSession(botSession);
     if (botSession && botSession.activeOrderId && !openOrder) botSession.activeOrderId = null;
-    const scheduling = textMessage && isSchedulingOrQuote(text);
+    const hasAiEngine = Boolean(this.llmAssistant);
+    const anyHandoffKeyword =
+      events.some((item) => isTextMessage(item.type, item.text) && containsHandoffKeyword(item.text!.trim(), record.config.handoffKeywords)) ||
+      (textMessage && containsHandoffKeyword(text, record.config.handoffKeywords));
+    const scheduling = textMessage && isSchedulingOrQuote(text) && !(
+      hasAiEngine && record.config.assistantObjective.trim()
+    );
     const orderIntent = textMessage && (isOrderIntent(text) || textMentionsItem(text, record.config.catalog));
     const historicalOrderRequested = textMessage && isHistoricalOrderInquiry(text);
     const historicalOrderRepeatRequested = textMessage && isHistoricalOrderRepeatRequest(text);
@@ -1017,11 +1074,11 @@ export class LocalAttendanceService {
           : historicalOrderRepeatRequested && !historicalOrderRepeatCanStart
             ? "Algum item ou opção do pedido anterior não está disponível no cardápio atual. Posso ajudar a montar outro pedido?"
             : undefined;
-    const routeToOrdering = Boolean(this.llmAssistant) && orderingActive && !scheduling && !greetingText &&
+    const routeToOrdering = hasAiEngine && orderingActive && !scheduling && !greetingText &&
       (!historicalOrderRequested || historicalOrderRepeatCanStart) && (orderIntent || Boolean(openOrder) || historicalOrderRepeatCanStart);
     const initiallyHandled =
       !textMessage ||
-      containsHandoffKeyword(text, record.config.handoffKeywords) ||
+      anyHandoffKeyword ||
       scheduling ||
       (orderIntent && !routeToOrdering && !historicalOrderRequested);
     const exactAnswer = textMessage && !routeToOrdering && !historicalOrderRequested
@@ -1051,10 +1108,9 @@ export class LocalAttendanceService {
     let llmOutcome: LlmTurnOutcome | undefined;
     let producedOrder: CustomerOrder | null = null;
     if (canUseBot && !initiallyHandled && !exactAnswer && !greeting && !selectorEligible &&
-      !historicalOrderResponse && this.llmAssistant) {
-      const knowledgeSnapshot = record.config.knowledge.map((entry) => ({ ...entry }));
-      const override = copyTenantLlmOverride(record.config.llm);
-      const orderSession = routeToOrdering
+      !historicalOrderResponse && hasAiEngine) {
+      const needOrderSession = routeToOrdering;
+      const orderSession = needOrderSession
         ? new OrderSession({
             tenantId,
             conversationId: plannedConversationId,
@@ -1062,8 +1118,8 @@ export class LocalAttendanceService {
             profile: copyProfile(record.config.profile),
             existing: openOrder ? copyOrder(openOrder) : null,
             customerText: text,
-            now: this.now,
-            createId: this.createId,
+            now: this.nowFn,
+            createId: this.createIdFn,
             sink: this.orderSink,
             ...(record.config.orderIntegration?.webhookUrl ? { webhookUrl: record.config.orderIntegration.webhookUrl } : {}),
             ...(record.config.orderIntegration?.webhookSecret ? { webhookSecret: record.config.orderIntegration.webhookSecret } : {})
@@ -1080,28 +1136,47 @@ export class LocalAttendanceService {
             if (!result.ok) throw new Error(result.message);
           }
         }
-        llmOutcome = await this.llmAssistant.completeTurn({
-          businessName: record.config.businessName,
-          segment: record.config.segment,
-          assistantObjective: record.config.assistantObjective,
-          customerText: text,
-          history: botSession ? this.historyForBotSession(botSession) : [],
-          knowledge: knowledgeSnapshot,
-          profile: copyProfile(record.config.profile),
-          catalog: copyCatalog(record.config.catalog),
-          orderingEnabled: orderingActive,
-          order: routeToOrdering && (openOrder || historicalOrderRepeatCanStart)
+        if (this.llmAssistant) {
+          const knowledgeSnapshot = record.config.knowledge.map((entry) => ({ ...entry }));
+          const override = copyTenantLlmOverride(record.config.llm);
+          const currentOrderForPrompt = routeToOrdering && (openOrder || historicalOrderRepeatCanStart)
             ? copyOrder(orderSession?.order() ?? openOrder!)
-            : null,
-          ...(historicalOrderRequested ? { historicalOrderRequested: true } : {}),
-          ...(historicalOrderRequested ? { historicalOrderMode: historicalOrderRepeatCanStart ? "repeat" : "read_only" } : {}),
-          ...(historicalOrder ? { historicalOrder: copyOrder(historicalOrder) } : {}),
-          ...(orderSession ? { session: orderSession } : {}),
-          ...(override ? { override } : {})
-        });
+            : null;
+          let ragContext;
+          if (this.ragService?.enabled) {
+            try {
+              ragContext = await this.ragService.retrieve({
+                tenantId,
+                query: text,
+                config: copyConfig(record.config),
+                openOrder: currentOrderForPrompt
+              });
+            } catch {
+              // Falha no RAG degrada com segurança para o prompt padrão.
+            }
+          }
+          llmOutcome = await this.llmAssistant.completeTurn({
+            businessName: record.config.businessName,
+            segment: record.config.segment,
+            assistantObjective: record.config.assistantObjective,
+            customerText: text,
+            history: botSession ? this.historyForBotSession(botSession) : [],
+            knowledge: knowledgeSnapshot,
+            profile: copyProfile(record.config.profile),
+            catalog: copyCatalog(record.config.catalog),
+            orderingEnabled: orderingActive,
+            order: currentOrderForPrompt,
+            ...(historicalOrderRequested ? { historicalOrderRequested: true } : {}),
+            ...(historicalOrderRequested ? { historicalOrderMode: historicalOrderRepeatCanStart ? "repeat" : "read_only" } : {}),
+            ...(historicalOrder ? { historicalOrder: copyOrder(historicalOrder) } : {}),
+            ...(orderSession ? { session: orderSession } : {}),
+            ...(override ? { override } : {}),
+            ...(ragContext ? { rag: ragContext } : {})
+          });
+        }
         producedOrder = orderSession?.order() ?? null;
         if (producedOrder?.status === "awaiting_confirmation") {
-          if (llmOutcome.kind === "reply") {
+          if (llmOutcome?.kind === "reply") {
             // O total e o resumo são calculados no servidor, não pelo modelo.
             llmOutcome = { kind: "reply", text: summarizeOrder(producedOrder) };
           } else {
@@ -1115,7 +1190,11 @@ export class LocalAttendanceService {
       }
     }
     this.mutateTenantState(tenantId, () => {
-      if (this.processedInboundIds.has(dedupeKey)) return;
+      const unprocessed = events.filter((item) => {
+        const key = `${tenantId}:${item.provider}:${item.providerEventId}`;
+        return !this.processedInboundIds.has(key);
+      });
+      if (unprocessed.length === 0) return;
 
       if (sessionToInvalidate && this.botSessions.get(sessionKey)?.id === sessionToInvalidate.id) {
         // Expirar encerra apenas o contexto. O pedido continua no histórico operacional.
@@ -1126,14 +1205,14 @@ export class LocalAttendanceService {
       const conversationKey = `${tenantId}:${customerPhone}`;
       let conversationId = this.conversationKeys.get(conversationKey);
       let conversation = conversationId ? this.conversations.get(conversationId) : undefined;
-      const now = this.now().toISOString();
+      const now = this.nowFn().toISOString();
 
       if (!conversation) {
         conversationId = plannedConversationId;
         conversation = {
-          id: conversationId,
+          id: plannedConversationId,
           tenantId,
-          customerName: event.consumerProfileName?.trim() || customerPhone,
+          customerName: latestEvent.consumerProfileName?.trim() || customerPhone,
           customerPhone,
           state: "BOT_ACTIVE",
           assignedUserId: null,
@@ -1146,50 +1225,61 @@ export class LocalAttendanceService {
           lastInboundPhoneNumberId: null,
           lastInboundAt: null
         };
-        this.conversations.set(conversationId, conversation);
-        this.conversationKeys.set(conversationKey, conversationId);
-        this.messages.set(conversationId, []);
+        this.conversations.set(plannedConversationId, conversation);
+        this.conversationKeys.set(conversationKey, plannedConversationId);
+        this.messages.set(plannedConversationId, []);
       } else if (conversation.state === "CLOSED") {
         this.transition(conversation, "BOT_ACTIVE");
         conversation.assignedUserId = null;
         conversation.waitingSince = null;
       }
+      if (!conversation) return;
 
-      const messageText = text || `[${event.type === "unknown" ? "mensagem" : event.type} recebida]`;
-      const customerMessage: Message = {
-        id: this.createId(),
-        conversationId: conversation.id,
-        role: "CUSTOMER",
-        text: messageText,
-        createdAt: Number.isFinite(event.occurredAt.getTime()) ? event.occurredAt.toISOString() : now,
-        deliveryStatus: "RECEIVED",
-        authorName: event.consumerProfileName?.trim() || null,
-        ...(botSession ? { botSessionId: botSession.id } : {})
-      };
-      this.pushMessage(customerMessage);
-      conversation.lastInboundMessageId = customerMessage.id;
-      conversation.lastInboundSource = event.source ?? "LEGACY_UNKNOWN";
-      conversation.lastInboundPhoneNumberId = event.providerPhoneNumberId;
-      conversation.lastInboundAt = customerMessage.createdAt;
-      conversation.lastMessagePreview = messageText;
-      conversation.updatedAt = now;
-      this.notifyCustomer({
-        tenantId,
-        phone: customerPhone,
-        text: messageText,
-        at: customerMessage.createdAt,
-        messageId: customerMessage.id,
-        source: event.source ?? "LEGACY_UNKNOWN"
-      });
+      for (const item of unprocessed) {
+        const itemText = item.text?.trim() ?? "";
+        const messageText = itemText || `[${item.type === "unknown" ? "mensagem" : item.type} recebida]`;
+        const customerMessage: Message = {
+          id: this.createIdFn(),
+          conversationId: conversation.id,
+          role: "CUSTOMER",
+          text: messageText,
+          createdAt: Number.isFinite(item.occurredAt.getTime()) ? item.occurredAt.toISOString() : now,
+          deliveryStatus: "RECEIVED",
+          authorName: item.consumerProfileName?.trim() || null,
+          ...(botSession ? { botSessionId: botSession.id } : {})
+        };
+        this.pushMessage(customerMessage);
+        conversation.lastInboundMessageId = customerMessage.id;
+        conversation.lastInboundSource = item.source ?? "LEGACY_UNKNOWN";
+        conversation.lastInboundPhoneNumberId = item.providerPhoneNumberId;
+        conversation.lastInboundAt = customerMessage.createdAt;
+        conversation.lastMessagePreview = messageText;
+        conversation.updatedAt = now;
+        this.notifyCustomer({
+          tenantId,
+          phone: customerPhone,
+          text: messageText,
+          at: customerMessage.createdAt,
+          messageId: customerMessage.id,
+          source: item.source ?? "LEGACY_UNKNOWN"
+        });
+      }
 
       if (conversation.state === "BOT_ACTIVE") {
+        const currentHasAiEngine = Boolean(this.llmAssistant);
         const currentOrdering = currentRecord.config.orderingEnabled && currentRecord.config.catalog.some((item) => item.available);
-        const currentRoute = Boolean(this.llmAssistant) && currentOrdering && !scheduling && !greeting &&
+        const currentScheduling = textMessage && isSchedulingOrQuote(text) && !(
+          currentHasAiEngine && currentRecord.config.assistantObjective.trim()
+        );
+        const currentHandoffKeyword =
+          unprocessed.some((item) => isTextMessage(item.type, item.text) && containsHandoffKeyword(item.text!.trim(), currentRecord.config.handoffKeywords)) ||
+          (textMessage && containsHandoffKeyword(text, currentRecord.config.handoffKeywords));
+        const currentRoute = currentHasAiEngine && currentOrdering && !currentScheduling && !greeting &&
           !historicalOrderRequested && (orderIntent || Boolean(openOrder));
         const shouldHandoff =
           !textMessage ||
-          containsHandoffKeyword(text, currentRecord.config.handoffKeywords) ||
-          scheduling ||
+          currentHandoffKeyword ||
+          currentScheduling ||
           (orderIntent && !currentRoute && !historicalOrderRequested);
         if (shouldHandoff) {
           this.transition(conversation, "WAITING_HUMAN");
@@ -1252,9 +1342,11 @@ export class LocalAttendanceService {
         this.clearBotSessionForConversation(conversation.id);
       }
 
-      // A mensagem só se torna deduplicada depois que todos os efeitos estão prontos.
-      // mutateState grava esse ID junto com conversa e histórico, ou desfaz os três.
-      this.processedInboundIds.add(dedupeKey);
+      // As mensagens só se tornam deduplicadas depois que todos os efeitos estão prontos.
+      // mutateState grava esses IDs junto com conversa e histórico, ou desfaz tudo.
+      for (const item of unprocessed) {
+        this.processedInboundIds.add(`${tenantId}:${item.provider}:${item.providerEventId}`);
+      }
     });
   }
 
@@ -1400,7 +1492,7 @@ export class LocalAttendanceService {
 
     const botSessions = new Map<string, BotConversationSession>();
     const sessionIds = new Set<string>();
-    const restoreTime = this.now().getTime();
+    const restoreTime = this.nowFn().getTime();
     for (const item of snapshot.botSessions ?? []) {
       const session = copyBotSession(item);
       const conversation = conversations.get(session.conversationId);
@@ -1496,7 +1588,7 @@ export class LocalAttendanceService {
   }
 
   private expireBotSessions(): void {
-    const now = this.now().getTime();
+    const now = this.nowFn().getTime();
     const expired = [...this.botSessions.entries()].filter(([, session]) => {
       const lastActivity = Date.parse(session.lastActivityAt);
       const conversation = this.conversations.get(session.conversationId);
@@ -1506,7 +1598,9 @@ export class LocalAttendanceService {
     if (expired.length === 0) return;
     this.mutateState(() => {
       for (const [key, session] of expired) {
-        if (this.botSessions.get(key)?.id === session.id) this.botSessions.delete(key);
+        if (this.botSessions.get(key)?.id === session.id) {
+          this.botSessions.delete(key);
+        }
       }
     });
   }
@@ -1558,7 +1652,7 @@ export class LocalAttendanceService {
 
   private appendBotReply(conversation: Conversation, text: string, now: string, botSessionId?: string): void {
     const botMessage: Message = {
-      id: this.createId(),
+      id: this.createIdFn(),
       conversationId: conversation.id,
       role: "BOT",
       text,
@@ -1597,7 +1691,7 @@ export class LocalAttendanceService {
       if (!current) return;
       current.status = update.status;
       current.resultCode = update.resultCode;
-      current.completedAt = this.now().toISOString();
+      current.completedAt = this.nowFn().toISOString();
       current.blockedReason = update.status === "BLOCKED" ? current.blockedReason : null;
       if (update.status === "ACCEPTED") {
         current.attemptCount = 1;
@@ -1697,5 +1791,6 @@ export class LocalAttendanceService {
       };
     }
   }
+
 }
 

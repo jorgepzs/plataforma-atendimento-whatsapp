@@ -398,6 +398,39 @@ const migrations = [
       SET enabled_since = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
       WHERE enabled = 1 AND enabled_since IS NULL;
     `
+  },
+  {
+    version: 11,
+    name: "elevenlabs_integration",
+    sql: `
+      -- Mantém o identificador histórico da migração sem criar tabelas da integração
+      -- descartada. Bancos que já a aplicaram são preservados sem limpeza destrutiva.
+    `
+  },
+  {
+    version: 12,
+    name: "tenant_rag_hybrid_storage",
+    sql: `
+      -- Sem FK para attendance_tenants: o repositório de snapshot substitui a tabela
+      -- de empresas a cada gravação, mas os chunks devem sobreviver a essas gravações.
+      CREATE TABLE rag_knowledge_chunks (
+        id TEXT PRIMARY KEY,
+        tenant_id TEXT NOT NULL,
+        source_kind TEXT NOT NULL CHECK (source_kind IN ('profile', 'policy', 'faq', 'catalog_item')),
+        source_key TEXT NOT NULL,
+        title TEXT NOT NULL,
+        content TEXT NOT NULL,
+        metadata_json TEXT NOT NULL CHECK (json_valid(metadata_json)),
+        content_hash TEXT NOT NULL,
+        embedding_json TEXT CHECK (embedding_json IS NULL OR json_valid(embedding_json)),
+        embedding_model TEXT,
+        updated_at TEXT NOT NULL,
+        UNIQUE (tenant_id, source_kind, source_key)
+      );
+
+      CREATE INDEX rag_knowledge_chunks_tenant_idx
+        ON rag_knowledge_chunks (tenant_id, source_kind);
+    `
   }
 ] as const;
 

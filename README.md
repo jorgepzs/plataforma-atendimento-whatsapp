@@ -24,8 +24,9 @@
 - Atualização da fila em tempo real por SSE autenticado; o evento só avisa que houve uma mudança, e o painel consulta os dados pelas rotas protegidas.
 - Persistência local em SQLite para empresas, sessões, conversas, mensagens e filas de entrada e saída.
 - Base de conhecimento por empresa: perfil, FAQ de referência e catálogo com preços e opções.
-- Assistente que interpreta a mensagem, consulta o cardápio e monta um rascunho de pedido. O total é calculado no servidor.
-- Confirmação só depois que o cliente responde ao resumo. Reserva, agendamento e orçamento continuam com uma pessoa.
+- RAG híbrido por empresa: os chunks são persistidos no SQLite local ou PostgreSQL; o ranking lexical funciona sem provedor externo e embeddings são opcionais.
+- Assistente que interpreta a mensagem, consulta a base relevante e monta um rascunho de pedido. O total é calculado no servidor.
+- Confirmação só depois que o cliente responde ao resumo. O campo de objetivo orienta atendimento, venda ou orçamento; as travas de preço, confirmação e encaminhamento continuam no servidor.
 - Classificador opcional com Ollama local, restrito à FAQ, e gateway compatível com OpenAI (OpenRouter, Ollama ou LM Studio).
 - Canal WhatsApp com provedor selecionável por empresa: pareamento por QR (Baileys, desligado por padrão) ou esqueleto da API oficial da Meta.
 - Adaptador de envio Cloud API isolado para teste local, **desligado por padrão** e limitado a uma tentativa externa persistida.
@@ -212,7 +213,7 @@ Esta rota não é a API oficial. Ela usa o protocolo do WhatsApp Web por uma bib
 
 Recomendação prática: um chip novo, só para o atendimento, que possa ser perdido. Não o número pessoal principal. Não o número em que o cliente já atende pelo aplicativo WhatsApp Business, a menos que ele saiba que o celular deixa de ser a sessão dona daquele número.
 
-O painel ainda entra com as contas de demonstração (`AtendeLocal123!`). Antes de publicar o endereço, troque essas senhas. Elas são públicas neste repositório.
+As contas de demonstração (`AtendeLocal123!`) são públicas neste repositório e só funcionam fora de produção. O backend as bloqueia em `NODE_ENV=production`; ainda falta o fluxo para cadastrar usuários reais com segurança, então não exponha o painel para clientes.
 
 ### Migrar para a API oficial da Meta
 
@@ -252,7 +253,9 @@ Esse perfil guarda sessão e SQLite no volume `whatsapp-data` e não usa o Postg
 | Comando | Para que serve |
 | --- | --- |
 | `npm run dev:local` | Inicia painel e API com SQLite local |
+| `npm run dev:sqlite` | Inicia o mesmo modo SQLite explicitamente |
 | `npm run dev:memory` | Inicia a demonstração sem persistir estado entre reinícios |
+| `npm run dev:postgres` | Inicia API e Vite com PostgreSQL local configurado; o login visual do painel ainda não está habilitado nesse modo |
 | `npm run check` | Executa typecheck, testes e builds definidos pelo projeto |
 | `npm run test:local` | Smoke test local usando armazenamento em memória |
 | `npm run test:sqlite` | Smoke test com banco SQLite temporário |
@@ -265,8 +268,9 @@ Os smoke tests usam portas locais `3000` e `5173`; encerre `dev:local` antes de 
 - O modo de atendimento local exige `ENABLE_LOCAL_DEMO=true`, execução fora de produção e API em loopback. O launcher `dev:local` aplica essa configuração automaticamente.
 - As respostas do bot e do atendente ficam como `SIMULATED` por padrão. O projeto não envia mensagens ao WhatsApp durante o uso normal.
 - O envio de teste é opcional, somente local e não produtivo. Ele exige SQLite, canal e destinatários explicitamente configurados; não é uma integração multi-tenant de produção.
-- O store PostgreSQL persiste eventos de webhook, mas ainda não tem o worker conversacional, o painel administrativo e as rotas de atendimento local.
-- As contas e credenciais de demonstração não são autenticação de produção. O Compose é uma base de infraestrutura, não uma declaração de prontidão para produção.
+- O backend PostgreSQL já tem persistência unificada de atendimento, identidade/sessões, Consumer, fila inbound e RAG, com as rotas correspondentes. Isso ainda é um protótipo: as migrações foram verificadas em PostgreSQL descartável, mas Compose, implantação em VPS e operação de produção não foram validados.
+- O RAG fica persistido no SQLite local e no PostgreSQL. SQLite usa ranking lexical determinístico e embeddings opcionais; PostgreSQL também usa FTS em português. Sem configurar embeddings, nenhuma chamada externa de embedding é feita.
+- As contas e credenciais de demonstração são desativadas em `NODE_ENV=production`; ainda não há fluxo para provisionar usuários reais. O Compose é uma base de infraestrutura, não uma declaração de prontidão para produção.
 - Arquivos `.env`, bancos locais, dados em `.data/` e artefatos em `work/` ficam fora do Git. Configure segredos somente em arquivos privados e nunca os envie em commits.
 
 ## 📚 Documentação
@@ -277,6 +281,7 @@ Os smoke tests usam portas locais `3000` e `5173`; encerre `dev:local` antes de 
 - [Classificador de FAQ com Ollama](docs/ia-local-ollama.md)
 - [Gateway de IA compatível com OpenAI](docs/adr/0004-gateway-llm-compativel-com-openai.md)
 - [Base de conhecimento e pedidos](docs/adr/0006-base-de-conhecimento-e-pedidos.md)
+- [Estado de guardrails, RAG e PostgreSQL](docs/estado-atual-rag-guardrails-postgres.md)
 - [Como plugar um sistema de pedidos](docs/integracao-pedidos.md)
 - [Canal WhatsApp e a rota não oficial](docs/adr/0005-canal-whatsapp-nao-oficial.md)
 - [Contrato do envio WhatsApp de teste](docs/contrato-saida-whatsapp.md)
@@ -286,7 +291,7 @@ Os smoke tests usam portas locais `3000` e `5173`; encerre `dev:local` antes de 
 
 ---
 
-Este projeto está em desenvolvimento. Recursos de produção — incluindo autenticação administrativa, processamento conversacional persistente em PostgreSQL e credenciais de canal por empresa — ainda precisam ser implementados antes de atender clientes reais.
+Este projeto está em desenvolvimento. O backend PostgreSQL unificado já existe, mas cadastro seguro de empresas/canais, credenciais reais por tenant, hardening da autenticação e validação operacional continuam pendentes antes de atender clientes reais.
 
 ## 📄 Licença
 
