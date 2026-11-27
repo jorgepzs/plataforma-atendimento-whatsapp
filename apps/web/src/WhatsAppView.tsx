@@ -1,6 +1,6 @@
 import { useEffect, useState, type FormEvent } from "react";
 import { QrCode, Wifi } from "lucide-react";
-import { ApiError, apiRequest, formatApiError, tenantPath, type Session, type WhatsAppAntiBan, type WhatsAppUsage } from "./api";
+import { ApiError, apiRequest, formatApiError, tenantPath, type Session, type WhatsAppAntiBan, type WhatsAppSendObservability, type WhatsAppUsage } from "./api";
 import { useToast } from "./feedback";
 import { Badge, Button, ConfirmDialog, Skeleton } from "./ui";
 
@@ -8,8 +8,10 @@ type ProviderId = "unofficial_qr" | "meta_cloud";
 
 export interface WhatsAppChannelView {
   enabled: boolean;
+  testUnlimitedMode?: boolean;
   provider?: ProviderId;
   status?: string;
+  decryptFailuresLastHour?: number;
   halted?: boolean;
   haltReason?: string | null;
   phoneMasked?: string | null;
@@ -22,6 +24,7 @@ export interface WhatsAppChannelView {
   message?: string;
   antiBan?: WhatsAppAntiBan;
   usage?: WhatsAppUsage;
+  sendObservability?: WhatsAppSendObservability;
 }
 
 const statusLabels: Record<string, string> = {
@@ -169,6 +172,7 @@ export function WhatsAppView({
 
   if (!view && !error) return <Skeleton className="card" />;
   const usage = view?.usage;
+  const sendObservability = view?.sendObservability;
   const cap = usage?.effectiveDailyCap ?? view?.antiBan?.warmupDailyCap ?? view?.antiBan?.dailyCap ?? 0;
   const sent = usage?.sentToday ?? 0;
   const ratio = cap > 0 ? Math.min(100, Math.round((sent / cap) * 100)) : 0;
@@ -213,13 +217,51 @@ export function WhatsAppView({
         </section>
       )}
       {view?.enabled && (
+        view.testUnlimitedMode ? (
+          <section className="section-card">
+            <h2>Modo de teste sem limites de ritmo</h2>
+            <p className="banner wait" role="status">
+              Tetos por minuto, hora e dia, aquecimento, horário silencioso, limite de links, bloqueios de repetição e esperas artificiais estão desativados nesta execução local.
+            </p>
+            <p>Opt-out, consentimento para avisos proativos, validação do destinatário e estado da conexão continuam valendo.</p>
+          </section>
+        ) : (
+          <section className="section-card">
+            <h2>Proteção do número</h2>
+            <div className="meter" aria-label="Mensagens enviadas hoje">
+              <div style={{ width: `${ratio}%` }} />
+            </div>
+            <p><strong>{sent}</strong> de <strong>{cap || "—"}</strong> mensagens hoje{usage?.inWarmup ? " (teto de aquecimento)" : ""}.</p>
+            <p>Aquecimento dia {usage?.warmupDay ?? 1} de {usage?.warmupDays ?? view.antiBan?.warmupDays ?? 7}{view.pairedAt ? "" : ". Ainda sem data de pareamento, o teto menor continua valendo."}</p>
+          </section>
+        )
+      )}
+      {view?.enabled && sendObservability && (
         <section className="section-card">
-          <h2>Proteção do número</h2>
-          <div className="meter" aria-label="Mensagens enviadas hoje">
-            <div style={{ width: `${ratio}%` }} />
+          <h2>Observabilidade do envio</h2>
+          <p className="muted" title="Indicadores internos desta instância, não são o Quality Rating oficial da Meta. Os contadores são mantidos em memória e reiniciam com a API.">
+            Última hora · métricas internas, não representam a qualidade oficial da Meta.
+          </p>
+          <div className="split-line">
+            <p>Fila: <strong>{sendObservability.queueDepth}</strong> aguardando · <strong>{sendObservability.activeSends}</strong> em processamento (inclui esperas de limite)</p>
+            <p>Maior espera na fila: <strong>{formatDuration(sendObservability.oldestQueuedForMs)}</strong></p>
           </div>
-          <p><strong>{sent}</strong> de <strong>{cap || "—"}</strong> mensagens hoje{usage?.inWarmup ? " (teto de aquecimento)" : ""}.</p>
-          <p>Aquecimento dia {usage?.warmupDay ?? 1} de {usage?.warmupDays ?? view.antiBan?.warmupDays ?? 7}{view.pairedAt ? "" : ". Ainda sem data de pareamento, o teto menor continua valendo."}</p>
+          <div className="split-line">
+            <p>Espera média na fila: <strong>{formatDuration(sendObservability.averageQueueWaitMs)}</strong> em {sendObservability.queueWaitSamples} envios</p>
+            <p>Limite por minuto: <strong>{sendObservability.minuteLimitWaits}</strong> esperas concluídas · <strong>{formatDuration(sendObservability.minuteLimitWaitMs)}</strong> no total</p>
+          </div>
+          <p>Mensagens aceitas pelo transporte: <strong>{sendObservability.acceptedMessages}</strong> · operações com falha: <strong>{sendObservability.failed}</strong></p>
+          {Object.keys(sendObservability.failuresByReason).length > 0 && (
+            <p>Falhas por motivo: {Object.entries(sendObservability.failuresByReason)
+              .sort(([left], [right]) => left.localeCompare(right))
+              .map(([reason, count]) => `${reason}: ${count}`).join(" · ")}</p>
+          )}
+          {sendObservability.lastFailureAt && (
+            <p>Última falha: <strong>{sendObservability.lastFailureReason}</strong> · {new Date(sendObservability.lastFailureAt).toLocaleTimeString("pt-BR")}</p>
+          )}
+          {(view.decryptFailuresLastHour ?? 0) > 0 && (
+            <p className="banner bad" role="status">Falhas de descriptografia na última hora: {view.decryptFailuresLastHour}. Confira a saúde da sessão antes de aumentar o ritmo de envio.</p>
+          )}
         </section>
       )}
       {halt && (
@@ -275,4 +317,9 @@ function presentPhone(phone: string | null | undefined): string {
   if (!phone) return "Nenhum número pareado";
   const tail = phone.replace(/\D/g, "").slice(-4);
   return tail ? `Número •••• ${tail}` : phone;
+}
+
+function formatDuration(milliseconds: number): string {
+  if (milliseconds < 1_000) return `${Math.max(0, Math.round(milliseconds))} ms`;
+  return `${(milliseconds / 1_000).toFixed(1)} s`;
 }

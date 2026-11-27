@@ -6,6 +6,7 @@ import { installPlan } from "./install-all.mjs";
 test("keeps WhatsApp, LLM and local AI settings from the env file", () => {
   const selected = selectDocumentedEnvironment({
     WHATSAPP_CHANNEL_ENABLED: "true",
+    WHATSAPP_TEST_UNLIMITED: "true",
     WHATSAPP_PROVIDER: "unofficial_qr",
     LLM_MODEL: "qwen2.5:1.5b",
     LOCAL_AI_ENABLED: "false",
@@ -13,6 +14,7 @@ test("keeps WhatsApp, LLM and local AI settings from the env file", () => {
     npm_config_cache: "/tmp"
   });
   assert.equal(selected.WHATSAPP_CHANNEL_ENABLED, "true");
+  assert.equal(selected.WHATSAPP_TEST_UNLIMITED, "true");
   assert.equal(selected.WHATSAPP_PROVIDER, "unofficial_qr");
   assert.equal(selected.LLM_MODEL, "qwen2.5:1.5b");
   assert.equal(selected.LOCAL_AI_ENABLED, "false");

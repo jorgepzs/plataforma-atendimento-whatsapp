@@ -94,6 +94,18 @@ export function SettingsView({
           <textarea rows={2} disabled={disabled} required maxLength={1000} value={config.greeting} onChange={(event) => setConfig({ ...config, greeting: event.target.value })} />
           {!config.greeting.trim() && <small role="alert">Informe a saudação.</small>}
         </label>
+        <label className="field">
+          <span>Objetivo do bot</span>
+          <textarea
+            rows={3}
+            disabled={disabled}
+            maxLength={1000}
+            value={config.assistantObjective}
+            onChange={(event) => setConfig({ ...config, assistantObjective: event.target.value })}
+            placeholder="Ex.: entender a necessidade do cliente e montar o pedido; ou coletar dados para preparar um orçamento."
+          />
+          <small>Oriente o atendimento. O bot continuará usando os dados cadastrados e encaminhará o que depender de avaliação humana. Até 1000 caracteres.</small>
+        </label>
         <label className="check-line">
           <input type="checkbox" checked={config.orderingEnabled} disabled={disabled} onChange={(event) => setConfig({ ...config, orderingEnabled: event.target.checked })} />
           Assistente pode montar pedidos

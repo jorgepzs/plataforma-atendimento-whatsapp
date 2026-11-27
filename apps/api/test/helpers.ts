@@ -12,6 +12,7 @@ export const testConfig: AppConfig = {
   metaRequireSignature: true,
   metaAppSecret: "app-secret",
   metaGraphApiVersion: "v24.0",
+  botSessionTtlMinutes: 60,
   localAiEnabled: false,
   whatsappOutboundEnabled: false,
   whatsappOutboundAllowedRecipients: [],

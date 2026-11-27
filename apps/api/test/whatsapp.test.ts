@@ -40,6 +40,20 @@ function clockAt(iso: string, random = 0): Clock & { sleeps: number[] } {
   };
 }
 
+function advancingClockAt(iso: string, random = 0): Clock & { sleeps: number[] } {
+  const sleeps: number[] = [];
+  let currentMs = Date.parse(iso);
+  return {
+    sleeps,
+    now: () => new Date(currentMs),
+    sleep: async (ms: number) => {
+      sleeps.push(ms);
+      currentMs += ms;
+    },
+    random: () => random
+  };
+}
+
 function baseInput(overrides: Partial<Parameters<typeof evaluateOutbound>[0]> = {}) {
   const settings = defaultAntiBanSettings();
   return {
@@ -112,7 +126,12 @@ class FakeTransport implements WhatsAppTransport {
   async stop(): Promise<void> {}
 }
 
-function providerWith(transport: FakeTransport, clock: Clock = clockAt("2026-06-15T15:00:00.000Z")) {
+function providerWith(
+  transport: FakeTransport,
+  clock: Clock = clockAt("2026-06-15T15:00:00.000Z"),
+  settings = defaultAntiBanSettings(),
+  testUnlimitedMode = false
+) {
   const meta = new FakeTransport("meta_cloud", "disconnected");
   const transports = transport.id === "meta_cloud"
     ? { unofficial_qr: new FakeTransport("unofficial_qr", "disconnected"), meta_cloud: transport }
@@ -121,8 +140,9 @@ function providerWith(transport: FakeTransport, clock: Clock = clockAt("2026-06-
   const provider = new PolicyWhatsAppProvider({
     transports,
     store,
-    settings: defaultAntiBanSettings(),
+    settings,
     defaultProvider: transport.id,
+    testUnlimitedMode,
     clock
   });
   return { provider, store, transports };
@@ -171,7 +191,10 @@ describe("anti-ban policy", () => {
 
   it("enforces global and per-contact caps, warm-up and opt-out", () => {
     expect(evaluateOutbound(baseInput({ global: { minute: 4, hour: 0, day: 0 } }))).toMatchObject({ reason: "rate_minute" });
-    expect(evaluateOutbound(baseInput({ contactBucket: { minute: 0, hour: 0, day: 15 } }))).toMatchObject({ reason: "contact_rate_day" });
+    expect(evaluateOutbound(baseInput({
+      settings: { ...defaultAntiBanSettings(), perContactDailyCap: 15 },
+      contactBucket: { minute: 0, hour: 0, day: 15 }
+    }))).toMatchObject({ reason: "contact_rate_day" });
     expect(inWarmup("2026-06-10T15:00:00.000Z", new Date("2026-06-15T15:00:00.000Z"), 7)).toBe(true);
     expect(inWarmup("2026-01-01T00:00:00.000Z", new Date("2026-06-15T15:00:00.000Z"), 7)).toBe(false);
     expect(evaluateOutbound(baseInput({
@@ -198,6 +221,41 @@ describe("anti-ban policy", () => {
       }
     }))).toMatchObject({ reason: "duplicate_text" });
     expect(evaluateOutbound(baseInput({ recentIdenticalRecipients: 8 }))).toMatchObject({ reason: "mass_identical" });
+  });
+
+  it("bypasses rate, warm-up, quiet-hour, link and delay limits in local unlimited test mode", () => {
+    const settings = { ...defaultAntiBanSettings(), proactiveEnabled: true, sendTyping: true };
+    const contact = {
+      ...baseInput().contact!,
+      optedIn: true,
+      outboundCount: 0
+    };
+    const decision = evaluateOutbound(baseInput({
+      now: new Date("2026-11-26T00:30:00.000Z"),
+      kind: "proactive",
+      text: "Links: https://a.test e https://b.test",
+      pairedAt: "2026-11-26T00:00:00.000Z",
+      settings,
+      contact,
+      global: { minute: 999, hour: 999, day: 999 },
+      contactBucket: { minute: 999, hour: 999, day: 999 },
+      testUnlimitedMode: true
+    }));
+
+    expect(decision).toMatchObject({ allow: true, delayMs: 0, sendTyping: false });
+    const previous = evaluateOutbound(baseInput());
+    if (!previous.allow) throw new Error("A resposta base deveria passar pela política normal.");
+    expect(evaluateOutbound(baseInput({
+      testUnlimitedMode: true,
+      recentIdenticalRecipients: 999,
+      contact: {
+        ...contact,
+        lastOutboundText: previous.fingerprint,
+        lastOutboundAt: "2026-11-26T00:29:00.000Z"
+      }
+    }))).toMatchObject({ allow: true });
+    expect(evaluateOutbound(baseInput({ testUnlimitedMode: true, contact: { ...contact, optedOut: true } })))
+      .toMatchObject({ allow: false, reason: "opted_out" });
   });
 
   it("adds a longer first-contact delay, jitter bounds and a typing pause", () => {
@@ -247,6 +305,264 @@ describe("provider guard", () => {
     expect(transport.reads).toEqual([{ tenantId: "pizzaria-demo", to: "5511999990000@s.whatsapp.net", messageId: "inbound-1" }]);
     expect(transport.presence.map((item) => item.presence)).toEqual(["composing", "paused"]);
     expect(transport.sent).toEqual([{ tenantId: "pizzaria-demo", to: "5511999990000@s.whatsapp.net", text: "Funcionamos das 18h às 23h." }]);
+  });
+
+  it("keeps replies queued at the global per-minute cap and sends after the next minute starts", async () => {
+    const clock = advancingClockAt("2026-06-15T15:00:30.000Z");
+    const transport = new FakeTransport("unofficial_qr");
+    const settings = {
+      ...defaultAntiBanSettings(),
+      minDelayMs: 500,
+      maxDelayMs: 500,
+      firstMessageExtraDelayMs: 0,
+      warmupMessagesPerMinute: 4,
+      sendTyping: false
+    };
+    const { provider } = providerWith(transport, clock, settings);
+
+    for (let index = 0; index < settings.messagesPerMinute; index += 1) {
+      const phone = `551199999000${index}`;
+      provider.recordInbound("pizzaria-demo", phone, clock.now().toISOString(), "oi");
+      const sent = await provider.sendText("pizzaria-demo", {
+        to: phone,
+        text: `Resposta ${index + 1}`,
+        kind: "reply",
+        role: "BOT"
+      });
+      expect(sent.ok).toBe(true);
+    }
+
+    const nextPhone = "5511999990005";
+    provider.recordInbound("pizzaria-demo", nextPhone, clock.now().toISOString(), "oi");
+    const queued = await provider.sendText("pizzaria-demo", {
+      to: nextPhone,
+      text: "Resposta na próxima janela",
+      kind: "reply",
+      role: "BOT"
+    });
+
+    expect(queued).toMatchObject({ ok: true, chunks: 1 });
+    expect(clock.sleeps).toContain(28_000);
+    expect(transport.sent).toHaveLength(settings.messagesPerMinute + 1);
+    expect(transport.sent.at(-1)?.text).toBe("Resposta na próxima janela");
+    expect(provider.sendObservabilitySnapshot("pizzaria-demo")).toMatchObject({
+      window: "rolling_1h",
+      queueDepth: 0,
+      activeSends: 0,
+      minuteLimitWaits: 1,
+      minuteLimitWaitMs: 28_000,
+      acceptedMessages: settings.messagesPerMinute + 1,
+      failed: 0
+    });
+    expect(provider.sendObservabilitySnapshot("other-tenant").acceptedMessages).toBe(0);
+  });
+
+  it("sends immediately without rate-limit waits or typing in local unlimited test mode", async () => {
+    const clock = advancingClockAt("2026-06-15T15:00:30.000Z");
+    const transport = new FakeTransport("unofficial_qr");
+    const { provider } = providerWith(transport, clock, defaultAntiBanSettings(), true);
+
+    for (let index = 0; index < 6; index += 1) {
+      const phone = `551199999000${index}`;
+      provider.recordInbound("pizzaria-demo", phone, clock.now().toISOString(), "oi");
+      const sent = await provider.sendText("pizzaria-demo", {
+        to: phone,
+        text: `Teste sem teto ${index}`,
+        kind: "reply",
+        role: "BOT"
+      });
+      expect(sent.ok).toBe(true);
+    }
+
+    expect(clock.sleeps).toEqual([]);
+    expect(transport.sent).toHaveLength(6);
+    expect(transport.presence).toHaveLength(0);
+    expect(provider.sendObservabilitySnapshot("pizzaria-demo")).toMatchObject({
+      minuteLimitWaits: 0,
+      minuteLimitWaitMs: 0,
+      acceptedMessages: 6,
+      failed: 0
+    });
+  });
+
+  it("queues replies at the per-contact per-minute cap too", async () => {
+    const clock = advancingClockAt("2026-06-15T15:00:30.000Z");
+    const transport = new FakeTransport("unofficial_qr");
+    const settings = {
+      ...defaultAntiBanSettings(),
+      messagesPerMinute: 20,
+      minDelayMs: 500,
+      maxDelayMs: 500,
+      firstMessageExtraDelayMs: 0,
+      warmupMessagesPerMinute: 5,
+      sendTyping: false
+    };
+    const { provider } = providerWith(transport, clock, settings);
+    const phone = "5511999990000";
+    provider.recordInbound("pizzaria-demo", phone, clock.now().toISOString(), "oi");
+
+    for (let index = 0; index < settings.perContactPerMinute; index += 1) {
+      const sent = await provider.sendText("pizzaria-demo", {
+        to: phone,
+        text: `Resposta ${index + 1}`,
+        kind: "reply",
+        role: "BOT"
+      });
+      expect(sent.ok).toBe(true);
+    }
+
+    const queued = await provider.sendText("pizzaria-demo", {
+      to: phone,
+      text: "Resposta após o limite do contato",
+      kind: "reply",
+      role: "BOT"
+    });
+
+    expect(queued).toMatchObject({ ok: true, chunks: 1 });
+    expect(clock.sleeps).toContain(29_000);
+    expect(transport.sent).toHaveLength(settings.perContactPerMinute + 1);
+    expect(provider.sendObservabilitySnapshot("pizzaria-demo")).toMatchObject({
+      minuteLimitWaits: 1,
+      minuteLimitWaitMs: 29_000,
+      acceptedMessages: settings.perContactPerMinute + 1,
+      failed: 0
+    });
+  });
+
+  it("keeps hourly caps as blocks instead of waiting in the minute queue", async () => {
+    const clock = advancingClockAt("2026-06-15T15:00:30.000Z");
+    const transport = new FakeTransport("unofficial_qr");
+    const settings = {
+      ...defaultAntiBanSettings(),
+      messagesPerMinute: 20,
+      warmupMessagesPerMinute: 5,
+      messagesPerHour: 1,
+      warmupMessagesPerHour: 1,
+      minDelayMs: 500,
+      maxDelayMs: 500,
+      firstMessageExtraDelayMs: 0,
+      sendTyping: false
+    };
+    const { provider } = providerWith(transport, clock, settings);
+
+    provider.recordInbound("pizzaria-demo", "5511999990000", clock.now().toISOString(), "oi");
+    const first = await provider.sendText("pizzaria-demo", {
+      to: "5511999990000",
+      text: "Primeira resposta",
+      kind: "reply",
+      role: "BOT"
+    });
+    provider.recordInbound("pizzaria-demo", "5511999990001", clock.now().toISOString(), "oi");
+    const capped = await provider.sendText("pizzaria-demo", {
+      to: "5511999990001",
+      text: "Resposta acima do limite por hora",
+      kind: "reply",
+      role: "BOT"
+    });
+
+    expect(first.ok).toBe(true);
+    expect(capped).toMatchObject({ ok: false, reason: "rate_hour" });
+    expect(clock.sleeps).toEqual([500]);
+    expect(transport.sent).toHaveLength(1);
+    expect(provider.sendObservabilitySnapshot("pizzaria-demo")).toMatchObject({
+      acceptedMessages: 1,
+      failed: 1,
+      failuresByReason: { rate_hour: 1 }
+    });
+  });
+
+  it("reports per-tenant queue depth and wait without exposing recipient data", async () => {
+    let currentMs = Date.parse("2026-06-15T15:00:00.000Z");
+    const clock: Clock = {
+      now: () => new Date(currentMs),
+      sleep: async (milliseconds) => { currentMs += milliseconds; },
+      random: () => 0
+    };
+    const transport = new FakeTransport("unofficial_qr");
+    let releaseFirst: () => void = () => undefined;
+    let markFirstStarted: () => void = () => undefined;
+    const firstTransportCall = new Promise<void>((resolve) => { markFirstStarted = resolve; });
+    const holdFirstTransportCall = new Promise<void>((resolve) => { releaseFirst = resolve; });
+    let transportCalls = 0;
+    transport.sendText = async (tenantId, input) => {
+      transport.sent.push({ tenantId, ...input });
+      transportCalls += 1;
+      if (transportCalls === 1) {
+        markFirstStarted();
+        await holdFirstTransportCall;
+      }
+      return { ok: true, providerMessageId: `id-${transportCalls}` };
+    };
+    const settings = {
+      ...defaultAntiBanSettings(),
+      minDelayMs: 500,
+      maxDelayMs: 500,
+      firstMessageExtraDelayMs: 0,
+      sendTyping: false
+    };
+    const { provider } = providerWith(transport, clock, settings);
+    const firstPhone = "5511999990000";
+    const secondPhone = "5511999990001";
+    provider.recordInbound("pizzaria-demo", firstPhone, clock.now().toISOString(), "oi");
+    const first = provider.sendText("pizzaria-demo", {
+      to: firstPhone, text: "Primeira", kind: "reply", role: "BOT"
+    });
+    await firstTransportCall;
+    provider.recordInbound("pizzaria-demo", secondPhone, clock.now().toISOString(), "oi");
+    const second = provider.sendText("pizzaria-demo", {
+      to: secondPhone, text: "Segunda", kind: "reply", role: "BOT"
+    });
+    currentMs += 1_500;
+
+    expect(provider.sendObservabilitySnapshot("pizzaria-demo")).toMatchObject({
+      queueDepth: 1,
+      activeSends: 1,
+      oldestQueuedForMs: 1_500
+    });
+    expect(JSON.stringify(provider.sendObservabilitySnapshot("pizzaria-demo"))).not.toContain(firstPhone);
+    expect(JSON.stringify(provider.sendObservabilitySnapshot("pizzaria-demo"))).not.toContain(secondPhone);
+
+    releaseFirst();
+    await Promise.all([first, second]);
+    expect(provider.sendObservabilitySnapshot("pizzaria-demo")).toMatchObject({
+      queueDepth: 0,
+      activeSends: 0,
+      queueWaitSamples: 2,
+      averageQueueWaitMs: 750,
+      acceptedMessages: 2,
+      failed: 0
+    });
+  });
+
+  it("counts accepted chunks when a multi-message reply fails partway through", async () => {
+    const transport = new FakeTransport("unofficial_qr");
+    let sends = 0;
+    transport.sendText = async (tenantId, input) => {
+      sends += 1;
+      transport.sent.push({ tenantId, ...input });
+      return sends === 1
+        ? { ok: true, providerMessageId: "accepted-first-chunk" }
+        : { ok: false, reason: "network" };
+    };
+    const settings = { ...defaultAntiBanSettings(), minDelayMs: 1, maxDelayMs: 1, sendTyping: false };
+    const { provider } = providerWith(transport, clockAt("2026-06-15T15:00:00.000Z"), settings);
+    provider.recordInbound("pizzaria-demo", "5511999990000", "2026-06-15T14:59:00.000Z", "oi");
+
+    const outcome = await provider.sendText("pizzaria-demo", {
+      to: "5511999990000",
+      text: "x".repeat(1_000),
+      kind: "reply",
+      role: "BOT"
+    });
+
+    expect(outcome).toMatchObject({ ok: false, reason: "network", acceptedChunks: 1 });
+    expect(sends).toBe(2);
+    expect(provider.sendObservabilitySnapshot("pizzaria-demo")).toMatchObject({
+      acceptedMessages: 1,
+      failed: 1,
+      failuresByReason: { network: 1 },
+      lastAcceptedAt: expect.any(String)
+    });
   });
 
   it("sends one opt-out confirmation and then blocks the bot", async () => {
@@ -387,12 +703,74 @@ describe("baileys transport", () => {
     expect(transport.status("pizzaria-demo")).toMatchObject({ status: "session_replaced", halted: true });
     expect(sockets).toHaveLength(1);
   });
+
+  it("opens one socket when connect overlaps a slow start", async () => {
+    let started = 0;
+    let release: () => void = () => undefined;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const transport = new BaileysWhatsAppTransport({
+      sessionDir: tempDir(),
+      factory: {
+        create: async () => {
+          started += 1;
+          await gate;
+          return new FakeSocket();
+        }
+      },
+      clock: clockAt("2026-06-15T15:00:00.000Z"),
+      reconnectBaseMs: 2_000,
+      reconnectMaxMs: 60_000,
+      onInbound: () => undefined,
+      onStatus: () => undefined
+    });
+    const first = transport.connect("pizzaria-demo");
+    for (let attempt = 0; attempt < 10 && started === 0; attempt += 1) await Promise.resolve();
+    const second = transport.connect("pizzaria-demo");
+    release();
+    await first;
+    await second;
+    expect(started).toBe(1);
+    expect(transport.status("pizzaria-demo").decryptFailuresLastHour).toBe(0);
+  });
+
+  it("ends the current socket before opening the next one", async () => {
+    const events: string[] = [];
+    const sockets: FakeSocket[] = [];
+    const transport = new BaileysWhatsAppTransport({
+      sessionDir: tempDir(),
+      factory: {
+        create: async () => {
+          events.push("create");
+          const socket = new FakeSocket();
+          socket.decryptFailuresLastHour = () => 4;
+          socket.onEnd = () => events.push("end");
+          sockets.push(socket);
+          return socket;
+        }
+      },
+      clock: clockAt("2026-06-15T15:00:00.000Z"),
+      reconnectBaseMs: 2_000,
+      reconnectMaxMs: 60_000,
+      onInbound: () => undefined,
+      onStatus: () => undefined
+    });
+    await transport.connect("pizzaria-demo");
+    expect(transport.status("pizzaria-demo").decryptFailuresLastHour).toBe(4);
+    sockets[0]?.emit("connection.update", { connection: "close", lastDisconnect: { error: { output: { statusCode: 428 } } } });
+    await transport.whenIdle();
+    expect(events).toEqual(["create", "end", "create"]);
+    expect(sockets).toHaveLength(2);
+  });
 });
 
 class FakeSocket implements BaileysLikeSocket {
-  user?: { id?: string };
+  user: { id?: string } | undefined = undefined;
   private readonly listeners = new Map<string, Array<(payload: any) => void>>();
   readonly sent: unknown[] = [];
+  decryptFailuresLastHour?: () => number;
+  onEnd?: () => void;
 
   ev = { on: (event: string, listener: (payload: any) => void) => {
     const list = this.listeners.get(event) ?? [];
@@ -417,7 +795,9 @@ class FakeSocket implements BaileysLikeSocket {
     this.reads.push(...keys);
   }
   async logout(): Promise<void> {}
-  end(): void {}
+  end(): void {
+    this.onEnd?.();
+  }
 }
 
 describe("LID addressing", () => {

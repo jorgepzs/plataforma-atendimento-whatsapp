@@ -28,6 +28,7 @@ const bindTestChannelSchema = z.strictObject({
 const updateConfigSchema = z.strictObject({
   businessName: z.string().trim().min(1).max(120),
   segment: segmentSchema,
+  assistantObjective: z.string().trim().max(1000).optional(),
   greeting: z.string().trim().min(1).max(1000),
   knowledge: z.array(
     z.strictObject({

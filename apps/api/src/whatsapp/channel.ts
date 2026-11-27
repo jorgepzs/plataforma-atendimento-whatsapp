@@ -10,6 +10,7 @@ import type { AntiBanOverride, WhatsAppChannelConfig } from "./settings.js";
 import { publicAntiBan } from "./settings.js";
 import { blankTenant, ChannelStateStore } from "./state-store.js";
 import { maskPhone, optOutConfirmationText, safeTenantId } from "./text.js";
+import type { WhatsAppSendObservabilitySnapshot } from "./send-observability.js";
 import type { WhatsAppInboundMessage, WhatsAppProviderId, WhatsAppStatus, WhatsAppTransport } from "./types.js";
 
 export interface DeliveryUpdate {
@@ -27,7 +28,7 @@ export interface CreateChannelOptions {
   enqueue: (message: NormalizedInboundMessage) => Promise<unknown>;
   onDelivery?: (update: DeliveryUpdate) => void;
   onMessageAck?: (event: { tenantId: string; providerMessageId: string; ack: "delivered" | "read" | "failed"; detail?: string }) => void;
-  log?: (level: "info" | "warn", payload: Record<string, unknown>, message: string) => void;
+  log?: (level: "debug" | "info" | "warn", payload: Record<string, unknown>, message: string) => void;
   clock?: Clock;
   transports?: Partial<Record<WhatsAppProviderId, WhatsAppTransport>>;
   fetch?: typeof fetch;
@@ -44,6 +45,7 @@ export interface WhatsAppUsageView {
 
 export interface WhatsAppPublicView {
   enabled: true;
+  testUnlimitedMode: boolean;
   provider: WhatsAppProviderId;
   status: WhatsAppStatus["status"];
   halted: boolean;
@@ -52,10 +54,12 @@ export interface WhatsAppPublicView {
   pairedAt: string | null;
   lastError: string | null;
   qrAvailable: boolean;
+  decryptFailuresLastHour: number;
   metaConfigured: boolean;
   proactiveEnabled: boolean;
   antiBan: ReturnType<typeof publicAntiBan>;
   usage: WhatsAppUsageView;
+  sendObservability: WhatsAppSendObservabilitySnapshot;
 }
 
 function stateFile(config: WhatsAppChannelConfig): string | undefined {
@@ -91,6 +95,7 @@ export class WhatsAppChannel {
     const settings = this.provider.settingsFor(tenantId);
     return {
       enabled: true,
+      testUnlimitedMode: this.options.config.testUnlimitedMode,
       provider: status.provider,
       status: status.status,
       halted: status.halted,
@@ -99,10 +104,12 @@ export class WhatsAppChannel {
       pairedAt: status.pairedAt,
       lastError: status.lastError,
       qrAvailable: status.qrAvailable,
+      decryptFailuresLastHour: status.decryptFailuresLastHour ?? 0,
       metaConfigured: Boolean((tenant?.metaPhoneNumberId || this.options.config.metaPhoneNumberId) && (tenant?.metaAccessToken || this.options.config.metaAccessToken)),
       proactiveEnabled: settings.proactiveEnabled,
       antiBan: publicAntiBan(settings),
-      usage: this.provider.usageSnapshot(tenantId)
+      usage: this.provider.usageSnapshot(tenantId),
+      sendObservability: this.provider.sendObservabilitySnapshot(tenantId)
     };
   }
 
@@ -229,7 +236,12 @@ export function createWhatsAppChannel(options: CreateChannelOptions): WhatsAppCh
   let channel: WhatsAppChannel | undefined;
   const unofficial = options.transports?.unofficial_qr ?? new BaileysWhatsAppTransport({
     sessionDir: options.config.sessionDir ?? ".data/whatsapp/sessions",
-    factory: createBaileysSocketFactory(),
+    factory: createBaileysSocketFactory(options.log ? {
+      log: {
+        debug: (payload, message) => options.log?.("debug", payload, message),
+        warn: (payload, message) => options.log?.("warn", payload, message)
+      }
+    } : {}),
     clock,
     reconnectBaseMs: options.config.antiBan.reconnectBaseMs,
     reconnectMaxMs: options.config.antiBan.reconnectMaxMs,
@@ -251,6 +263,7 @@ export function createWhatsAppChannel(options: CreateChannelOptions): WhatsAppCh
     store,
     settings: options.config.antiBan,
     defaultProvider: options.config.provider,
+    testUnlimitedMode: options.config.testUnlimitedMode,
     clock,
     onAlert: (alert) => {
       const phone = store.snapshot().tenants[alert.tenantId]?.phoneNumber;

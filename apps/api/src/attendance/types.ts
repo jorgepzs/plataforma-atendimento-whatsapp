@@ -48,6 +48,8 @@ export interface KnowledgeEntry {
 export interface TenantConfig {
   businessName: string;
   segment: TenantSegment;
+  /** Meta de negócio que orienta o assistente; vazio usa o comportamento geral seguro. */
+  assistantObjective: string;
   greeting: string;
   knowledge: KnowledgeEntry[];
   handoffKeywords: string[];
@@ -125,6 +127,19 @@ export interface Message {
   /** Erro de envio, ou `delivered` / `read` depois do aceite do WhatsApp. */
   deliveryDetail?: string | null;
   authorName: string | null;
+  /** Identifica o contexto temporário do bot; ausente em mensagens legadas e humanas. */
+  botSessionId?: string | null;
+}
+
+/** Contexto temporário do bot; a conversa e o transcript continuam persistentes. */
+export interface BotConversationSession {
+  id: string;
+  tenantId: string;
+  customerPhone: string;
+  conversationId: string;
+  startedAt: string;
+  lastActivityAt: string;
+  activeOrderId: string | null;
 }
 
 export interface AttendanceSnapshot {
@@ -133,6 +148,7 @@ export interface AttendanceSnapshot {
   messages: Message[];
   outbox: OutboxEntry[];
   orders?: CustomerOrder[];
+  botSessions?: BotConversationSession[];
   processedInboundIds: string[];
 }
 
@@ -149,6 +165,7 @@ export interface CreateTenantInput {
 export interface UpdateTenantConfigInput {
   businessName: string;
   segment: TenantSegment;
+  assistantObjective?: string | undefined;
   greeting: string;
   knowledge: KnowledgeEntry[];
   handoffKeywords: string[];

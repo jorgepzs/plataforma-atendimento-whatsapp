@@ -75,6 +75,7 @@ export function emptyProfile(): BusinessProfile {
 export function normalizeConfig(config: TenantConfig): TenantConfig {
   return {
     ...config,
+    assistantObjective: typeof config.assistantObjective === "string" ? config.assistantObjective : "",
     profile: { ...emptyProfile(), ...config.profile },
     catalog: config.catalog ?? [],
     orderingEnabled: config.orderingEnabled === true,

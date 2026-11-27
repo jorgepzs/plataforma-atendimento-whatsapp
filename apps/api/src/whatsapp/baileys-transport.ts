@@ -1,5 +1,6 @@
 import { existsSync, readdirSync, rmSync } from "node:fs";
 import path from "node:path";
+import { SessionCredsError } from "./atomic-auth-state.js";
 import type { Clock } from "./clock.js";
 import { reconnectDelay } from "./clock.js";
 import { classifyDisconnect, disconnectDetails } from "./disconnect.js";
@@ -8,13 +9,18 @@ import { chatAddressFromInbound, destinationJid, phoneFromJid, safeTenantId } fr
 import type { WhatsAppConnectionStatus, WhatsAppInboundMessage, WhatsAppStatus, WhatsAppTransport, TransportSendResult } from "./types.js";
 
 export interface BaileysLikeSocket {
-  user?: { id?: string };
-  ev: { on(event: string, listener: (payload: any) => void): void };
+  user: { id?: string } | undefined;
+  ev: {
+    on(event: string, listener: (payload: any) => void): void;
+    removeAllListeners?(event?: string): void;
+  };
   sendMessage(jid: string, content: Record<string, unknown>): Promise<{ key?: { id?: string } } | undefined>;
   sendPresenceUpdate(presence: "composing" | "paused", jid: string): Promise<void>;
   readMessages(keys: Array<{ remoteJid: string; id: string; fromMe?: boolean }>): Promise<void>;
   logout(): Promise<void>;
   end(error?: Error): void;
+  flush?(): Promise<void>;
+  decryptFailuresLastHour?(): number;
 }
 
 export interface BaileysSocketFactory {
@@ -34,6 +40,9 @@ interface Runtime {
   attempt: number;
   stopped: boolean;
   reconnectPending: boolean;
+  opening?: Promise<void>;
+  decryptFailuresLastHour: number;
+  readDecryptFailures?: () => number;
   updatedAt: string;
 }
 
@@ -107,13 +116,10 @@ export class BaileysWhatsAppTransport implements WhatsAppTransport {
     runtime.stopped = true;
     runtime.generation += 1;
     runtime.qr = null;
-    const socket = runtime.socket;
-    runtime.socket = undefined;
-    try {
-      socket?.end(new Error("disconnect"));
-    } catch {
-      // Encerrar o socket é best-effort.
-    }
+    const opening = runtime.opening;
+    await this.retire(runtime, runtime.socket, "disconnect");
+    if (opening) await opening.catch(() => undefined);
+    if (runtime.socket) await this.retire(runtime, runtime.socket, "disconnect");
     this.release(runtime);
     this.publish(tenantId, { status: "disconnected", halted: false, haltReason: null, lastError: null, phoneNumber: runtime.phoneNumber });
   }
@@ -123,17 +129,17 @@ export class BaileysWhatsAppTransport implements WhatsAppTransport {
     runtime.stopped = true;
     runtime.generation += 1;
     runtime.qr = null;
+    const opening = runtime.opening;
     const socket = runtime.socket;
     runtime.socket = undefined;
     try {
       await socket?.logout();
     } catch {
-      try {
-        socket?.end(new Error("logout"));
-      } catch {
-        // A sessão local ainda será apagada.
-      }
+      // A sessão local ainda será apagada.
     }
+    await this.retire(runtime, socket, "logout");
+    if (opening) await opening.catch(() => undefined);
+    if (runtime.socket) await this.retire(runtime, runtime.socket, "logout");
     this.release(runtime);
     const directory = this.directoryFor(tenantId);
     if (directory) rmSync(directory, { recursive: true, force: true });
@@ -230,11 +236,29 @@ export class BaileysWhatsAppTransport implements WhatsAppTransport {
   }
 
   private async open(tenantId: string): Promise<void> {
+    const runtime = this.ensure(tenantId);
+    if (runtime.stopped) return;
+    if (runtime.opening) {
+      await runtime.opening;
+      if (runtime.socket || runtime.stopped || runtime.halted) return;
+    }
+    const task = this.openExclusive(tenantId);
+    runtime.opening = task;
+    try {
+      await task;
+    } finally {
+      if (runtime.opening === task) delete runtime.opening;
+    }
+  }
+
+  private async openExclusive(tenantId: string): Promise<void> {
     const directory = this.directoryFor(tenantId);
     const runtime = this.ensure(tenantId);
     if (!directory || runtime.stopped) return;
     runtime.generation += 1;
     const generation = runtime.generation;
+    await this.retire(runtime, runtime.socket, "replaced");
+    if (generation !== runtime.generation || runtime.stopped) return;
     if (!runtime.lock) {
       try {
         runtime.lock = acquireDirectoryLock(directory, this.options.isAlive ? { isAlive: this.options.isAlive } : {});
@@ -254,25 +278,23 @@ export class BaileysWhatsAppTransport implements WhatsAppTransport {
     try {
       socket = await this.options.factory.create(directory);
     } catch (error) {
+      const unreadable = error instanceof SessionCredsError;
       this.publish(tenantId, {
         status: "failed",
-        halted: false,
-        haltReason: null,
-        lastError: "socket_start_failed",
+        halted: unreadable,
+        haltReason: unreadable ? "session_unreadable" : null,
+        lastError: unreadable ? "session_unreadable" : "socket_start_failed",
         phoneNumber: runtime.phoneNumber
       });
-      this.scheduleReconnect(tenantId, generation);
+      if (!unreadable) this.scheduleReconnect(tenantId, generation);
       return;
     }
     if (generation !== runtime.generation || runtime.stopped) {
-      try {
-        socket.end(new Error("superseded"));
-      } catch {
-        // A geração nova já assumiu a sessão.
-      }
+      await this.retire(runtime, socket, "superseded");
       return;
     }
     runtime.socket = socket;
+    runtime.readDecryptFailures = () => socket.decryptFailuresLastHour?.() ?? runtime.decryptFailuresLastHour;
     socket.ev.on("connection.update", (update) => {
       const task = this.onConnection(tenantId, generation, socket, update);
       this.idle = this.idle.then(() => task.then(() => undefined, () => undefined));
@@ -303,11 +325,8 @@ export class BaileysWhatsAppTransport implements WhatsAppTransport {
       const details = disconnectDetails(update?.lastDisconnect?.error);
       const decision = classifyDisconnect(details.statusCode, details.text);
       if (runtime.socket === socket) runtime.socket = undefined;
-      try {
-        socket.end(new Error("closed"));
-      } catch {
-        // O socket já encerrou.
-      }
+      this.rememberFailures(runtime, socket);
+      await this.retire(runtime, socket, "closed");
       if (decision.action === "halt") {
         runtime.qr = null;
         runtime.generation += 1;
@@ -422,10 +441,47 @@ export class BaileysWhatsAppTransport implements WhatsAppTransport {
       attempt: 0,
       stopped: false,
       reconnectPending: false,
+      decryptFailuresLastHour: 0,
       updatedAt: this.options.clock.now().toISOString()
     };
     this.sessions.set(tenantId, created);
     return created;
+  }
+
+  private async retire(runtime: Runtime, socket: BaileysLikeSocket | undefined, reason: string): Promise<void> {
+    if (!socket) return;
+    if (runtime.socket === socket) runtime.socket = undefined;
+    this.rememberFailures(runtime, socket);
+    try {
+      socket.ev.removeAllListeners?.();
+    } catch {
+      // O emissor pode já ter sido encerrado.
+    }
+    try {
+      socket.end(new Error(reason));
+    } catch {
+      // O socket já encerrou.
+    }
+    try {
+      await socket.flush?.();
+    } catch {
+      // A gravação final é best-effort; a escrita atômica preserva o arquivo anterior.
+    }
+  }
+
+  private rememberFailures(runtime: Runtime, socket: BaileysLikeSocket | undefined): void {
+    const live = socket?.decryptFailuresLastHour?.();
+    if (typeof live === "number") runtime.decryptFailuresLastHour = live;
+  }
+
+  private failureCount(runtime: Runtime | undefined): number {
+    if (!runtime) return 0;
+    const live = runtime.readDecryptFailures?.();
+    if (typeof live === "number") {
+      runtime.decryptFailuresLastHour = live;
+      return live;
+    }
+    return runtime.decryptFailuresLastHour;
   }
 
   private release(runtime: Runtime): void {
@@ -465,6 +521,7 @@ export class BaileysWhatsAppTransport implements WhatsAppTransport {
       pairedAt: null,
       lastError: runtime?.lastError ?? null,
       qrAvailable: Boolean(runtime?.qr),
+      decryptFailuresLastHour: this.failureCount(runtime),
       updatedAt: runtime?.updatedAt ?? this.options.clock.now().toISOString()
     };
   }

@@ -318,6 +318,86 @@ const migrations = [
     sql: `
       ALTER TABLE attendance_messages ADD COLUMN delivery_detail TEXT;
     `
+  },
+  {
+    version: 8,
+    name: "temporary_bot_sessions",
+    sql: `
+      ALTER TABLE attendance_messages ADD COLUMN bot_session_id TEXT;
+      CREATE TABLE attendance_bot_sessions (
+        id TEXT PRIMARY KEY,
+        ordinal INTEGER NOT NULL UNIQUE,
+        tenant_id TEXT NOT NULL REFERENCES attendance_tenants(id) ON DELETE CASCADE,
+        conversation_id TEXT NOT NULL REFERENCES attendance_conversations(id) ON DELETE CASCADE,
+        customer_phone TEXT NOT NULL,
+        session_json TEXT NOT NULL CHECK (json_valid(session_json)),
+        UNIQUE (tenant_id, customer_phone)
+      );
+    `
+  },
+  {
+    version: 9,
+    name: "consumer_partner_integration",
+    sql: `
+      -- These tables intentionally have no FK to attendance_tenants/orders. The
+      -- attendance snapshot repository replaces those tables on each write.
+      CREATE TABLE consumer_partner_configs (
+        tenant_id TEXT PRIMARY KEY,
+        enabled INTEGER NOT NULL CHECK (enabled IN (0, 1)),
+        public_base_url TEXT NOT NULL,
+        merchant_id TEXT NOT NULL,
+        merchant_name TEXT NOT NULL,
+        sales_channel TEXT,
+        delivery_fee_received_by TEXT CHECK (
+          delivery_fee_received_by IS NULL OR delivery_fee_received_by IN ('MERCHANT', 'PARTNER')
+        ),
+        token_hash TEXT NOT NULL UNIQUE CHECK (length(token_hash) = 64 AND token_hash NOT GLOB '*[^0-9a-f]*'),
+        token_created_at TEXT NOT NULL,
+        product_mappings_json TEXT NOT NULL CHECK (json_valid(product_mappings_json)),
+        option_mappings_json TEXT NOT NULL CHECK (json_valid(option_mappings_json)),
+        variant_choices_json TEXT NOT NULL CHECK (json_valid(variant_choices_json)),
+        updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE consumer_order_details_contexts (
+        tenant_id TEXT NOT NULL,
+        order_id TEXT NOT NULL,
+        context_json TEXT NOT NULL CHECK (json_valid(context_json)),
+        updated_at TEXT NOT NULL,
+        PRIMARY KEY (tenant_id, order_id)
+      );
+
+      CREATE TABLE consumer_order_events (
+        tenant_id TEXT NOT NULL,
+        order_id TEXT NOT NULL,
+        event_id TEXT NOT NULL UNIQUE,
+        created_at TEXT NOT NULL,
+        details_requested_at TEXT,
+        PRIMARY KEY (tenant_id, order_id)
+      );
+      CREATE INDEX consumer_order_events_polling_idx
+        ON consumer_order_events (tenant_id, details_requested_at, created_at);
+
+      CREATE TABLE consumer_order_status_callbacks (
+        tenant_id TEXT NOT NULL,
+        order_id TEXT NOT NULL,
+        callback_hash TEXT NOT NULL,
+        status TEXT NOT NULL,
+        justification TEXT,
+        received_at TEXT NOT NULL,
+        PRIMARY KEY (tenant_id, callback_hash)
+      );
+    `
+  },
+  {
+    version: 10,
+    name: "consumer_activation_window",
+    sql: `
+      ALTER TABLE consumer_partner_configs ADD COLUMN enabled_since TEXT;
+      UPDATE consumer_partner_configs
+      SET enabled_since = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+      WHERE enabled = 1 AND enabled_since IS NULL;
+    `
   }
 ] as const;
 
@@ -450,9 +530,13 @@ class SqliteAttendanceRepository implements AttendanceStateRepository {
       FROM attendance_conversations ORDER BY ordinal
     `).all() as Array<Record<string, string | number | null>>;
     const messages = this.database.connection.prepare(`
-      SELECT id, conversation_id, role, text, created_at, delivery_status, delivery_detail, author_name
+      SELECT id, conversation_id, role, text, created_at, delivery_status, delivery_detail, author_name, bot_session_id
       FROM attendance_messages ORDER BY ordinal
     `).all() as Array<Record<string, string | number | null>>;
+    const botSessionRows = this.database.connection.prepare(`
+      SELECT session_json FROM attendance_bot_sessions ORDER BY ordinal
+    `).all() as Array<{ session_json: string }>;
+    const botSessions = botSessionRows.map((row) => JSON.parse(row.session_json) as NonNullable<AttendanceSnapshot["botSessions"]>[number]);
     const processedInboundIds = this.database.connection.prepare(`
       SELECT event_key FROM attendance_processed_inbound ORDER BY ordinal
     `).all() as Array<{ event_key: string }>;
@@ -495,7 +579,8 @@ class SqliteAttendanceRepository implements AttendanceStateRepository {
         text: String(row.text), createdAt: String(row.created_at),
         deliveryStatus: String(row.delivery_status) as AttendanceSnapshot["messages"][number]["deliveryStatus"],
         ...(row.delivery_detail ? { deliveryDetail: String(row.delivery_detail) } : {}),
-        authorName: row.author_name === null ? null : String(row.author_name)
+        authorName: row.author_name === null ? null : String(row.author_name),
+        ...(row.bot_session_id === null ? {} : { botSessionId: String(row.bot_session_id) })
       })),
       outbox: outbox.map((row) => ({
         id: String(row.id), tenantId: String(row.tenant_id), conversationId: String(row.conversation_id),
@@ -513,6 +598,7 @@ class SqliteAttendanceRepository implements AttendanceStateRepository {
         completedAt: row.completed_at === null ? null : String(row.completed_at)
       })),
       ...(orders.length > 0 ? { orders } : {}),
+      ...(botSessions.length > 0 ? { botSessions } : {}),
       processedInboundIds: processedInboundIds.map((row) => row.event_key)
     };
   }
@@ -521,6 +607,7 @@ class SqliteAttendanceRepository implements AttendanceStateRepository {
     this.database.transaction(() => {
       this.database.connection.exec(`
         DELETE FROM attendance_orders;
+        DELETE FROM attendance_bot_sessions;
         DELETE FROM attendance_outbox;
         DELETE FROM attendance_processed_inbound;
         DELETE FROM attendance_conversations;
@@ -554,14 +641,23 @@ class SqliteAttendanceRepository implements AttendanceStateRepository {
         conversation.lastInboundSource, conversation.lastInboundPhoneNumberId, conversation.lastInboundAt
       ));
 
+      const insertBotSession = this.database.connection.prepare(`
+        INSERT INTO attendance_bot_sessions
+          (id, ordinal, tenant_id, conversation_id, customer_phone, session_json)
+        VALUES (?, ?, ?, ?, ?, ?)
+      `);
+      (snapshot.botSessions ?? []).forEach((session, ordinal) => insertBotSession.run(
+        session.id, ordinal, session.tenantId, session.conversationId, session.customerPhone, JSON.stringify(session)
+      ));
+
       const insertMessage = this.database.connection.prepare(`
         INSERT INTO attendance_messages
-          (id, ordinal, conversation_id, role, text, created_at, delivery_status, delivery_detail, author_name)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+          (id, ordinal, conversation_id, role, text, created_at, delivery_status, delivery_detail, author_name, bot_session_id)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
       `);
       snapshot.messages.forEach((message, ordinal) => insertMessage.run(
         message.id, ordinal, message.conversationId, message.role, message.text, message.createdAt,
-        message.deliveryStatus, message.deliveryDetail ?? null, message.authorName
+        message.deliveryStatus, message.deliveryDetail ?? null, message.authorName, message.botSessionId ?? null
       ));
 
       const insertOutbox = this.database.connection.prepare(`

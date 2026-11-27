@@ -59,6 +59,7 @@ export interface AntiBanOverride {
 
 export interface WhatsAppChannelConfig {
   enabled: boolean;
+  testUnlimitedMode: boolean;
   provider: WhatsAppProviderId;
   sessionDir?: string;
   stateDir?: string;
@@ -73,11 +74,11 @@ export function defaultAntiBanSettings(): AntiBanSettings {
   return {
     proactiveEnabled: false,
     messagesPerMinute: 4,
-    messagesPerHour: 30,
+    messagesPerHour: 200,
     dailyCap: 120,
     perContactPerMinute: 2,
-    perContactPerHour: 6,
-    perContactDailyCap: 15,
+    perContactPerHour: 30,
+    perContactDailyCap: 40,
     minDelayMs: 3_000,
     maxDelayMs: 8_000,
     firstMessageExtraDelayMs: 12_000,
@@ -91,9 +92,9 @@ export function defaultAntiBanSettings(): AntiBanSettings {
     massIdenticalWindowMs: 30 * 60 * 1_000,
     warmupDays: 7,
     warmupMessagesPerMinute: 1,
-    warmupMessagesPerHour: 8,
+    warmupMessagesPerHour: 40,
     warmupDailyCap: 25,
-    warmupPerContactDailyCap: 6,
+    warmupPerContactDailyCap: 15,
     quietHoursStart: 21,
     quietHoursEnd: 8,
     quietHoursTimeZone: "America/Sao_Paulo",
@@ -108,6 +109,7 @@ export function defaultAntiBanSettings(): AntiBanSettings {
 export function disabledWhatsAppConfig(): WhatsAppChannelConfig {
   return {
     enabled: false,
+    testUnlimitedMode: false,
     provider: "unofficial_qr",
     panelOrigins: [],
     antiBan: defaultAntiBanSettings()
@@ -182,6 +184,13 @@ const optionalInt = z.preprocess(
 
 const whatsappEnvSchema = z.object({
   WHATSAPP_CHANNEL_ENABLED: z.preprocess((value) => {
+    if (typeof value !== "string" || value === "") return false;
+    const normalized = value.toLowerCase();
+    if (["1", "true", "yes", "on"].includes(normalized)) return true;
+    if (["0", "false", "no", "off"].includes(normalized)) return false;
+    return value;
+  }, z.boolean()),
+  WHATSAPP_TEST_UNLIMITED: z.preprocess((value) => {
     if (typeof value !== "string" || value === "") return false;
     const normalized = value.toLowerCase();
     if (["1", "true", "yes", "on"].includes(normalized)) return true;
@@ -280,6 +289,7 @@ export function loadWhatsAppConfig(environment: NodeJS.ProcessEnv): WhatsAppChan
   const alertWebhookUrl = assertWebhook(parsed.WHATSAPP_ALERT_WEBHOOK_URL);
   return {
     enabled: parsed.WHATSAPP_CHANNEL_ENABLED,
+    testUnlimitedMode: parsed.WHATSAPP_TEST_UNLIMITED,
     provider: parsed.WHATSAPP_PROVIDER,
     panelOrigins: panelOrigins(parsed.WHATSAPP_PANEL_ORIGINS),
     antiBan,

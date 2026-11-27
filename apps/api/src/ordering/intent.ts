@@ -20,6 +20,30 @@ const orderPatterns = [
   /\b(?:cardapio|pizza|pizzas|refrigerante|coca|guarana|bebida|suco)\b/
 ];
 
+const historicalOrderInquiryPatterns = [
+  /\b(?:qual|quais|como|quanto|cade|mostra|me mostra|me diga|me fala|consulta|consultar|ver)\b.{0,40}\b(?:meu|minha|o|a)?\s*(?:ultimo|anterior|passado)\s+(?:pedido|encomenda)\b/,
+  /\b(?:qual|quais|como|quanto|cade|mostra|me mostra|me diga|me fala|consulta|consultar|acompanhar|rastrear|status|andamento|foi|ver)\b.{0,60}\b(?:pedido|encomenda)\b.{0,60}\b(?:ontem|anteontem|anterior|passado|ultima vez|ultimo|historico)\b/,
+  /\b(?:pedido|encomenda)\b.{0,60}\b(?:ontem|anteontem|anterior|passado|ultima vez|ultimo|historico)\b.{0,50}\b(?:status|andamento|consulta|consultar|acompanhar|rastrear|qual|quanto|foi|mostrar|ver)\b/
+];
+
+const historicalOrderRepeatPatterns = [
+  /\b(?:repete|repita|repetir|refazer|fazer de novo|faz de novo)\b.{0,45}\b(?:(?:meu|minha|o|a)\s+)?(?:ultimo pedido|pedido(?:\s+de\s+(?:ontem|anteontem))?|pedido anterior)\b/,
+  /\b(?:quero|gostaria|preciso|vou|manda|mande|faz|faca)\b.{0,40}\b(?:o mesmo|a mesma|igual ao|igual a|igual)\b.{0,50}\b(?:ontem|anteontem|anterior|passado|ultima vez|ultimo pedido|pedido anterior)\b/,
+  /\b(?:pedir|fazer|repetir|repita|repete|refazer|mandar|enviar)\b.{0,40}\b(?:igual|mesmo)\b.{0,50}\b(?:ontem|anteontem|anterior|passado|ultima vez|ultimo pedido|pedido anterior)\b/,
+  /\b(?:repete|repita|repetir|refazer)\b.{0,40}\b(?:o pedido|a pizza|a ultima|o ultimo|igual)\b.{0,60}\b(?:ontem|anteontem|anterior|passado|ultima vez|ultimo pedido|pedido anterior)\b/,
+  /\b(?:repete|repita|repetir|fazer de novo)\b.{0,40}\b(?:a ultima|o ultimo|igual)\b.{0,40}\b(?:pizza|pedido|encomenda)\b/
+];
+
+export function isHistoricalOrderInquiry(text: string): boolean {
+  const normalized = normalizeText(text);
+  return isHistoricalOrderRepeatRequest(normalized) || historicalOrderInquiryPatterns.some((pattern) => pattern.test(normalized));
+}
+
+export function isHistoricalOrderRepeatRequest(text: string): boolean {
+  const normalized = normalizeText(text);
+  return historicalOrderRepeatPatterns.some((pattern) => pattern.test(normalized));
+}
+
 const confirmationPattern = /^(?:sim|confirmo|confirmado|pode confirmar|confirma|ok confirma|pode fechar|fechado|isso mesmo|esta certo|ta certo|pode mandar|manda)$/;
 
 export function isSchedulingOrQuote(text: string): boolean {

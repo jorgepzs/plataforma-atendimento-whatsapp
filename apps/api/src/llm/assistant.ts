@@ -31,12 +31,17 @@ export type LlmTurnOutcome =
 export interface LlmTurnInput {
   businessName: string;
   segment: TenantSegment;
+  assistantObjective?: string;
   customerText: string;
+  history?: readonly { role: "user" | "assistant"; content: string }[];
   knowledge: readonly KnowledgeEntry[];
   profile?: BusinessProfile;
   catalog?: readonly CatalogItem[];
   orderingEnabled?: boolean;
   order?: CustomerOrder | null;
+  historicalOrderRequested?: boolean;
+  historicalOrderMode?: "read_only" | "repeat";
+  historicalOrder?: CustomerOrder | null;
   session?: OrderSession;
   override?: TenantLlmOverride;
 }
@@ -51,6 +56,25 @@ const handoffNotice = "Vou encaminhar você para uma pessoa.";
 const maxCustomerTextLength = 4_000;
 const maxReplyLength = 1_500;
 const maxToolRounds = 4;
+const maxHistoryCharacters = 8_000;
+const maxRequestCharacters = 32_000;
+
+function boundedHistory(
+  history: readonly { role: "user" | "assistant"; content: string }[] | undefined,
+  maxCharacters: number
+): Array<{ role: "user" | "assistant"; content: string }> {
+  const selected: Array<{ role: "user" | "assistant"; content: string }> = [];
+  let remaining = Math.max(0, maxCharacters);
+  for (const message of [...(history ?? [])].slice(-8).reverse()) {
+    if (remaining <= 0) break;
+    const content = message.content.trim();
+    if (!content) continue;
+    const bounded = content.length > remaining ? content.slice(0, remaining) : content;
+    selected.push({ role: message.role, content: bounded });
+    remaining -= bounded.length;
+  }
+  return selected.reverse();
+}
 
 function sanitizeReply(text: string, secret?: string): string {
   const withoutSecret = secret ? text.split(secret).join("") : text;
@@ -91,19 +115,26 @@ export function createLlmAssistant(client: LlmChatClient, baseSettings: LlmSetti
       const prompt = buildSystemPrompt({
         businessName: input.businessName,
         segment: input.segment,
+        ...(input.assistantObjective !== undefined ? { assistantObjective: input.assistantObjective } : {}),
         knowledge: input.knowledge,
         profile,
         catalog,
         orderingEnabled,
-        order: input.order ?? null
+        order: input.order ?? null,
+        ...(input.historicalOrderRequested !== undefined ? { historicalOrderRequested: input.historicalOrderRequested } : {}),
+        ...(input.historicalOrderMode !== undefined ? { historicalOrderMode: input.historicalOrderMode } : {}),
+        ...(input.historicalOrder ? { historicalOrder: input.historicalOrder } : {})
       });
       if (!prompt) return failureFrom(baseSettings);
 
       try {
         const settings = resolveLlmSettings(baseSettings, input.override);
         const tools = orderingEnabled && input.session ? orderingTools : [transferTool];
+        const historyBudget = Math.min(maxHistoryCharacters, maxRequestCharacters - prompt.length - customerText.length);
+        const history = boundedHistory(input.history, historyBudget);
         const messages: LlmChatMessage[] = [
           { role: "system", content: prompt },
+          ...history,
           { role: "user", content: customerText }
         ];
         if (!settings.supportsTools) {
@@ -172,10 +203,13 @@ async function withoutTools(
   let plan = parseFallbackPlan(degradedText);
   let plain = degradedText;
   if (!plan && orderish && input.session) {
+    const jsonPrompt = buildJsonPrompt({ businessName: input.businessName, catalog });
+    const historyBudget = Math.min(maxHistoryCharacters, maxRequestCharacters - jsonPrompt.length - input.customerText.length);
     const second = await client.complete({
       settings,
       messages: [
-        { role: "system", content: buildJsonPrompt({ businessName: input.businessName, catalog }) },
+        { role: "system", content: jsonPrompt },
+        ...boundedHistory(input.history, historyBudget),
         { role: "user", content: input.customerText }
       ]
     });

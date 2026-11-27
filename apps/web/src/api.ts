@@ -91,6 +91,7 @@ export interface LlmConfig {
 export interface TenantConfig {
   businessName: string;
   segment: Tenant["segment"];
+  assistantObjective: string;
   greeting: string;
   knowledge: KnowledgeItem[];
   handoffKeywords: string[];
@@ -150,6 +151,23 @@ export interface WhatsAppUsage {
   warmupDay: number;
   warmupDays: number;
   inWarmup: boolean;
+}
+
+export interface WhatsAppSendObservability {
+  window: "rolling_1h";
+  queueDepth: number;
+  activeSends: number;
+  oldestQueuedForMs: number;
+  queueWaitSamples: number;
+  averageQueueWaitMs: number;
+  minuteLimitWaits: number;
+  minuteLimitWaitMs: number;
+  acceptedMessages: number;
+  failed: number;
+  failuresByReason: Record<string, number>;
+  lastAcceptedAt: string | null;
+  lastFailureAt: string | null;
+  lastFailureReason: string | null;
 }
 
 export interface WhatsAppAntiBan {

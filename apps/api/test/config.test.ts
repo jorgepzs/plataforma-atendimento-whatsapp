@@ -2,6 +2,12 @@ import { describe, expect, it } from "vitest";
 import { loadConfig } from "../src/config.js";
 
 describe("environment configuration", () => {
+  it("defaults the bot conversation context to 60 minutes and allows a configured TTL", () => {
+    expect(loadConfig({ NODE_ENV: "development" }).botSessionTtlMinutes).toBe(60);
+    expect(loadConfig({ NODE_ENV: "development", BOT_SESSION_TTL_MINUTES: "15" }).botSessionTtlMinutes).toBe(15);
+    expect(() => loadConfig({ NODE_ENV: "development", BOT_SESSION_TTL_MINUTES: "0" })).toThrow();
+  });
+
   it("treats empty optional environment values as unset", () => {
     const config = loadConfig({
       NODE_ENV: "development",
@@ -43,6 +49,23 @@ describe("environment configuration", () => {
   it("enables the demo explicitly only on loopback without a database", () => {
     expect(loadConfig({ NODE_ENV: "development", API_HOST: "127.0.0.1", ENABLE_LOCAL_DEMO: "true" }).localDemoEnabled).toBe(true);
     expect(loadConfig({ NODE_ENV: "development", API_HOST: "127.0.0.1" }).localDemoEnabled).toBe(false);
+  });
+
+  it("allows unlimited WhatsApp testing only inside the local demo with SQLite", () => {
+    const local = {
+      NODE_ENV: "development",
+      API_HOST: "127.0.0.1",
+      ENABLE_LOCAL_DEMO: "true",
+      LOCAL_SQLITE_PATH: "./attendance-test.sqlite",
+      WHATSAPP_TEST_UNLIMITED: "true"
+    };
+    expect(loadConfig(local).whatsapp.testUnlimitedMode).toBe(true);
+    expect(loadConfig({ NODE_ENV: "development" }).whatsapp.testUnlimitedMode).toBe(false);
+    expect(() => loadConfig({ ...local, NODE_ENV: "production" })).toThrow("WHATSAPP_TEST_UNLIMITED exige");
+    expect(() => loadConfig({ ...local, API_HOST: "0.0.0.0" })).toThrow("WHATSAPP_TEST_UNLIMITED exige");
+    expect(() => loadConfig({ ...local, ENABLE_LOCAL_DEMO: "false" })).toThrow("WHATSAPP_TEST_UNLIMITED exige");
+    expect(() => loadConfig({ ...local, DATABASE_URL: "postgresql://local/db" })).toThrow("WHATSAPP_TEST_UNLIMITED exige");
+    expect(() => loadConfig({ ...local, LOCAL_SQLITE_PATH: "" })).toThrow("WHATSAPP_TEST_UNLIMITED exige");
   });
 
   it("keeps local AI disabled by default and requires the local demo plus a model to enable it", () => {

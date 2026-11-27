@@ -82,7 +82,11 @@ const environmentSchema = z.object({
     if (["1", "true", "yes", "on"].includes(normalized)) return true;
     if (["0", "false", "no", "off"].includes(normalized)) return false;
     return value;
-  }, z.boolean())
+  }, z.boolean()),
+  BOT_SESSION_TTL_MINUTES: z.preprocess(
+    (value) => (value === "" || value === undefined ? 60 : value),
+    z.coerce.number().int().min(1).max(1_440)
+  )
 });
 
 export interface AppConfig {
@@ -95,6 +99,7 @@ export interface AppConfig {
   metaAppSecret?: string;
   metaRequireSignature: boolean;
   metaGraphApiVersion: string;
+  botSessionTtlMinutes: number;
   localDemoEnabled?: boolean;
   localSqlitePath?: string;
   localAiEnabled: boolean;
@@ -111,6 +116,13 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
   const parsed = environmentSchema.parse(environment);
   const whatsapp = loadWhatsAppConfig(environment);
   const channelWithoutDemo = whatsapp.enabled && !parsed.ENABLE_LOCAL_DEMO;
+
+  if (whatsapp.testUnlimitedMode && (
+    parsed.NODE_ENV !== "development" || !parsed.ENABLE_LOCAL_DEMO || parsed.DATABASE_URL || !parsed.LOCAL_SQLITE_PATH ||
+    !["127.0.0.1", "localhost", "::1"].includes(parsed.API_HOST)
+  )) {
+    throw new Error("WHATSAPP_TEST_UNLIMITED exige desenvolvimento local em loopback, demo local com SQLite e ausência de DATABASE_URL.");
+  }
 
   if (whatsapp.enabled && !whatsapp.sessionDir) {
     throw new Error("WHATSAPP_SESSION_DIR é obrigatório quando o canal WhatsApp está ligado.");
@@ -193,6 +205,7 @@ export function loadConfig(environment: NodeJS.ProcessEnv = process.env): AppCon
     metaVerifyToken: parsed.META_VERIFY_TOKEN,
     metaRequireSignature: parsed.META_REQUIRE_SIGNATURE,
     metaGraphApiVersion: parsed.META_GRAPH_API_VERSION,
+    botSessionTtlMinutes: parsed.BOT_SESSION_TTL_MINUTES,
     localDemoEnabled: parsed.ENABLE_LOCAL_DEMO,
     localAiEnabled: parsed.LOCAL_AI_ENABLED,
     whatsappOutboundEnabled: parsed.WHATSAPP_OUTBOUND_ENABLED,
